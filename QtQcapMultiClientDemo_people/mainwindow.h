@@ -39,15 +39,9 @@ namespace QDEEP_API {
 #define TARGET_FPS 30.0
 #define FRAME_INTERVAL (1.0 / TARGET_FPS)
 
-// ── Skeleton Keypoint Structures ────────────────────────────────────────────
-struct DrawKeypoint {
-    int x;
-    int y;
-    float probability;
-};
-
-struct DrawPerson {
-    DrawKeypoint keypoints[17];
+// ── Detection Box Structure ─────────────────────────────────────────────────
+struct DrawBox {
+    int original_x, original_y, original_w, original_h;
     int classId;
     float probability;
 };
@@ -64,9 +58,7 @@ struct ChannelContext {
     qcap2_event_handlers_t* pEventHandlers;
     qcap2_event_t* pEvent_vdec;
     qcap2_video_sink_t* pVideoSink;
-    qcap2_video_scaler_t* pScaler2;
-    qcap2_video_scaler_t* pScaler3;
-    qcap2_rcbuffer_t* m_pCurrentAIRCBuffer;
+    qcap2_video_scaler_t* pScaler;
 
     // Connected format properties
     ULONG m_nVideoWidth;
@@ -89,13 +81,13 @@ struct ChannelContext {
     int m_decFrameCount;
 
     // ── AI fields ────────────────────────────────────────────────────────
-    bool m_bSendBuffer;         // Whether to send frames to AI
-    double m_lastProcessTime;   // Last AI frame submission time
-    bool m_bFrameReady;         // Whether a frame is ready for AI
-    BYTE* m_pAIBuffer;          // NV12 data buffer for AI
-    ULONG m_nAIBufferLen;       // Length of AI buffer
-    int m_nAIWidth;             // Width for AI processing
-    int m_nAIHeight;            // Height for AI processing
+    bool m_bSendBuffer;
+    double m_lastProcessTime;
+    bool m_bFrameReady;
+    BYTE* m_pAIBuffer;
+    ULONG m_nAIBufferLen;
+    int m_nAIWidth;
+    int m_nAIHeight;
 
     ChannelContext(int id, const QString& streamUrl, uintptr_t winId);
     ~ChannelContext();
@@ -161,7 +153,7 @@ public:
     int ready_count;
     int active_camera_count;
 
-    std::vector<DrawPerson> draw_persons[MAX_BATCH];
+    std::vector<DrawBox> draw_boxes[MAX_BATCH];
     std::mutex draw_mtx;
 
 private:

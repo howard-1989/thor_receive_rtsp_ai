@@ -83,8 +83,8 @@ protected:
             QPoint globalPos = w->mapToGlobal(QPoint(0, 0));
             QPoint localPos = this->mapFromGlobal(globalPos);
 
-            double scale_x = (double)w->width() / (double)ctx->m_nVideoWidth;
-            double scale_y = (double)w->height() / (double)ctx->m_nVideoHeight;
+            double scale_x = (double)w->width() / (double)ctx->m_nAIWidth;
+            double scale_y = (double)w->height() / (double)ctx->m_nAIHeight;
 
             // Draw camera channel and people count overlay at top-left
             int people_count = (int)g_pMainwindow->draw_persons[i].size();
@@ -208,7 +208,9 @@ static QRETURN on_event_vdec_callback(PVOID pUserData) {
 ChannelContext::ChannelContext(int id, const QString& streamUrl, uintptr_t winId)
     : channelId(id), url(streamUrl), m_winId(winId),
       pClient(nullptr), pVdec(nullptr), pEventHandlers(nullptr),
-      pEvent_vdec(nullptr), pVideoSink(nullptr), pScaler(nullptr),
+      pEvent_vdec(nullptr), pVideoSink(nullptr),
+      pScaler2(nullptr), pScaler3(nullptr),
+      m_pCurrentAIRCBuffer(nullptr),
       m_nVideoWidth(0), m_nVideoHeight(0), m_dVideoFrameRate(0.0), m_nVideoEncoderFormat(0),
       m_frameCount(0), m_bDisplayEnabled(true),
       m_pushFrameCount(0), m_decFrameCount(0),
@@ -222,6 +224,10 @@ ChannelContext::~ChannelContext() {
     if (m_pAIBuffer) {
         delete[] m_pAIBuffer;
         m_pAIBuffer = nullptr;
+    }
+    if (m_pCurrentAIRCBuffer) {
+        qcap2_rcbuffer_release(m_pCurrentAIRCBuffer);
+        m_pCurrentAIRCBuffer = nullptr;
     }
     stop();
 }
@@ -265,7 +271,8 @@ bool ChannelContext::start() {
 void ChannelContext::stop() {
     PVOID pLocalClient = nullptr;
     qcap2_event_handlers_t* pLocalEventHandlers = nullptr;
-    qcap2_video_scaler_t* pLocalScaler = nullptr;
+    qcap2_video_scaler_t* pLocalScaler2 = nullptr;
+    qcap2_video_scaler_t* pLocalScaler3 = nullptr;
     qcap2_video_decoder_t* pLocalVdec = nullptr;
     qcap2_video_sink_t* pLocalVideoSink = nullptr;
 
@@ -273,13 +280,15 @@ void ChannelContext::stop() {
         QMutexLocker locker(&m_mutex);
         pLocalClient = pClient;
         pLocalEventHandlers = pEventHandlers;
-        pLocalScaler = pScaler;
+        pLocalScaler2 = pScaler2;
+        pLocalScaler3 = pScaler3;
         pLocalVdec = pVdec;
         pLocalVideoSink = pVideoSink;
 
         pClient = nullptr;
         pEventHandlers = nullptr;
-        pScaler = nullptr;
+        pScaler2 = nullptr;
+        pScaler3 = nullptr;
         pVdec = nullptr;
         pVideoSink = nullptr;
     }
@@ -306,15 +315,21 @@ void ChannelContext::stop() {
     if (pLocalVideoSink) {
         qcap2_video_sink_stop(pLocalVideoSink);
     }
-    if (pLocalScaler) {
-        qcap2_video_scaler_stop(pLocalScaler);
+    if (pLocalScaler2) {
+        qcap2_video_scaler_stop(pLocalScaler2);
+    }
+    if (pLocalScaler3) {
+        qcap2_video_scaler_stop(pLocalScaler3);
     }
 
     if (pLocalVideoSink) {
         qcap2_video_sink_delete(pLocalVideoSink);
     }
-    if (pLocalScaler) {
-        qcap2_video_scaler_delete(pLocalScaler);
+    if (pLocalScaler2) {
+        qcap2_video_scaler_delete(pLocalScaler2);
+    }
+    if (pLocalScaler3) {
+        qcap2_video_scaler_delete(pLocalScaler3);
     }
     if (pLocalVdec) {
         qcap2_video_decoder_delete(pLocalVdec);
@@ -329,6 +344,11 @@ void ChannelContext::stop() {
     }
     if (pLocalClient) {
         QCAP_DESTROY_BROADCAST_CLIENT(pLocalClient);
+    }
+
+    if (m_pCurrentAIRCBuffer) {
+        qcap2_rcbuffer_release(m_pCurrentAIRCBuffer);
+        m_pCurrentAIRCBuffer = nullptr;
     }
 
     qDebug() << "========== CH" << channelId << "Stop Sequence Finished ==========";
@@ -380,9 +400,9 @@ QRETURN ChannelContext::onConnected(
     qDebug() << "CH" << channelId << "Connected info:" << m_statusInfo;
 
     // Allocate AI buffer
-    m_nAIWidth = nVideoWidth;
-    m_nAIHeight = nVideoHeight;
-    m_nAIBufferLen = (nVideoWidth * nVideoHeight * 3) / 2;
+    m_nAIWidth = 640;
+    m_nAIHeight = 384;
+    m_nAIBufferLen = 640 * 384 * 3 / 2;
     if (m_pAIBuffer) delete[] m_pAIBuffer;
     m_pAIBuffer = new BYTE[m_nAIBufferLen]();
 
@@ -425,6 +445,7 @@ QRETURN ChannelContext::onConnected(
         return QCAP_RT_OK;
     }
 
+    qDebug() << "Trace: Creating video decoder property...";
     qcap2_video_encoder_property_t* pProp = qcap2_video_encoder_property_new();
     if (!pProp) {
         qCritical() << "CH" << channelId << "Failed to create video encoder property.";
@@ -441,23 +462,27 @@ QRETURN ChannelContext::onConnected(
         return QCAP_RT_OK;
     }
 
+    qDebug() << "Trace: Setting property1 on property object...";
     qcap2_video_encoder_property_set_property1(pProp,
         0,
-        QCAP_ENCODER_TYPE_SOFTWARE,
+        QCAP_ENCODER_TYPE_NVIDIA_NVENC,
         nVideoEncoderFormat,
         QCAP_COLORSPACE_TYPE_NV12,
-        nVideoWidth, nVideoHeight, dVideoFrameRate,
+        640, 384, dVideoFrameRate,
         QCAP_RECORD_PROFILE_MAIN, QCAP_RECORD_LEVEL_51, QCAP_RECORD_ENTROPY_CABAC, QCAP_RECORD_COMPLEXITY_0, QCAP_RECORD_MODE_CBR,
         8000, 40000000, 60, 0, FALSE, 0, 0, 0, FALSE, FALSE, FALSE, 0, 0, 0, 0, 0, 0);
     qcap2_video_encoder_property_set_high_perf(pProp, TRUE);
+    qDebug() << "Trace: Setting video property on decoder...";
     qcap2_video_decoder_set_video_property(pVdec, pProp);
     qcap2_video_encoder_property_delete(pProp);
 
+    qDebug() << "Trace: Configuring decoder events/queues...";
     qcap2_video_decoder_set_event(pVdec, pEvent_vdec);
     qcap2_video_decoder_set_multithread(pVdec, false);
     qcap2_video_decoder_set_packet_count(pVdec, 16);
     qcap2_video_decoder_set_frame_count(pVdec, 10);
 
+    qDebug() << "Trace: Starting video decoder...";
     QRESULT qres = qcap2_video_decoder_start(pVdec);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qCritical() << "qcap2_video_decoder_start failed for CH" << channelId << "qres =" << qres;
@@ -474,6 +499,7 @@ QRETURN ChannelContext::onConnected(
         return QCAP_RT_OK;
     }
 
+    qDebug() << "Trace: Creating video sink...";
     // Initialize Video Sink
     pVideoSink = qcap2_video_sink_new();
     if (!pVideoSink) {
@@ -491,6 +517,7 @@ QRETURN ChannelContext::onConnected(
         return QCAP_RT_OK;
     }
 
+    qDebug() << "Trace: Setting video sink properties...";
     int backendType = QCAP2_VIDEO_SINK_BACKEND_TYPE_DAVMF;
     if (getenv("QCAP_VO_USE_GSTREAMER") && QString(getenv("QCAP_VO_USE_GSTREAMER")) == "1") {
         backendType = QCAP2_VIDEO_SINK_BACKEND_TYPE_GSTREAMER;
@@ -504,26 +531,30 @@ QRETURN ChannelContext::onConnected(
 
     qcap2_video_format_t* pFormat = qcap2_video_format_new();
     if (pFormat) {
-        qcap2_video_format_set_property(pFormat, QCAP_COLORSPACE_TYPE_NV12, nVideoWidth, nVideoHeight, bVideoIsInterleaved, dVideoFrameRate);
+        qcap2_video_format_set_property(pFormat, QCAP_COLORSPACE_TYPE_NV12, 640, 384, bVideoIsInterleaved, dVideoFrameRate);
         qcap2_video_sink_set_video_format(pVideoSink, pFormat);
         qcap2_video_format_delete(pFormat);
     }
 
     if (m_bDisplayEnabled) {
+        qDebug() << "Trace: Starting video sink...";
         qres = qcap2_video_sink_start(pVideoSink);
         if (qres != QCAP_RS_SUCCESSFUL) {
             qCritical() << "qcap2_video_sink_start failed for CH" << channelId << "qres =" << qres;
         }
     }
 
-    // Initialize Video Scaler
-    pScaler = qcap2_video_scaler_new();
-    if (!pScaler) {
-        qCritical() << "CH" << channelId << "Failed to create video scaler.";
-        m_statusInfo = "Error: Failed to create video scaler";
+    qDebug() << "Trace: Creating video scaler 3...";
+    // Initialize Video Scalers (Scaler 3 only, Scaler 2 is bypassed because the HW decoder outputs 640x384 directly)
+    pScaler2 = nullptr;
+    pScaler3 = qcap2_video_scaler_new();
+    if (!pScaler3) {
+        qCritical() << "CH" << channelId << "Failed to create video scaler 3.";
+        m_statusInfo = "Error: Failed to create video scaler 3";
         qcap2_video_sink_stop(pVideoSink);
         qcap2_video_sink_delete(pVideoSink);
         pVideoSink = nullptr;
+        qcap2_video_decoder_stop(pVdec);
         qcap2_video_decoder_delete(pVdec);
         pVdec = nullptr;
         qcap2_event_handlers_remove_handler(pEventHandlers, nHandle_vdec);
@@ -536,25 +567,27 @@ QRETURN ChannelContext::onConnected(
         return QCAP_RT_OK;
     }
 
-    qcap2_video_scaler_set_backend_type(pScaler, QCAP2_VIDEO_SCALER_BACKEND_TYPE_DEFAULT);
-
-    qcap2_video_format_t* pScalerFormat = qcap2_video_format_new();
-    if (pScalerFormat) {
-        qcap2_video_format_set_property(pScalerFormat, QCAP_COLORSPACE_TYPE_NV12, nVideoWidth, nVideoHeight, bVideoIsInterleaved, dVideoFrameRate);
-        qcap2_video_scaler_set_video_format(pScaler, pScalerFormat);
-        qcap2_video_format_delete(pScalerFormat);
+    qDebug() << "Trace: Setting video scaler 3 properties...";
+    // 3. Scaler 3 (640x384 nvbuf transform to sysbuf via NPP)
+    qcap2_video_scaler_set_backend_type(pScaler3, QCAP2_VIDEO_SCALER_BACKEND_TYPE_NPP);
+    qcap2_video_format_t* pScalerFormat3 = qcap2_video_format_new();
+    if (pScalerFormat3) {
+        qcap2_video_format_set_property(pScalerFormat3, QCAP_COLORSPACE_TYPE_NV12, 640, 384, bVideoIsInterleaved, dVideoFrameRate);
+        qcap2_video_scaler_set_video_format(pScaler3, pScalerFormat3);
+        qcap2_video_format_delete(pScalerFormat3);
     }
-
-    qcap2_video_scaler_set_frame_count(pScaler, 8);
-    qcap2_video_scaler_set_src_buffer_hint(pScaler, QCAP2_BUFFER_HINT_DEFAULT);
-    qcap2_video_scaler_set_dst_buffer_hint(pScaler, QCAP2_BUFFER_HINT_DEFAULT);
-    qcap2_video_scaler_set_auto_run(pScaler, true);
-
-    qres = qcap2_video_scaler_start(pScaler);
+    qcap2_video_scaler_set_frame_count(pScaler3, 8);
+    qcap2_video_scaler_set_src_buffer_hint(pScaler3, QCAP2_BUFFER_HINT_CUDA);
+    qcap2_video_scaler_set_dst_buffer_hint(pScaler3, QCAP2_BUFFER_HINT_DEFAULT);
+    qcap2_video_scaler_set_auto_run(pScaler3, true);
+    
+    qDebug() << "Trace: Starting video scaler 3...";
+    qres = qcap2_video_scaler_start(pScaler3);
     if (qres != QCAP_RS_SUCCESSFUL) {
-        qCritical() << "qcap2_video_scaler_start failed for CH" << channelId << "qres =" << qres;
+        qCritical() << "qcap2_video_scaler_start for Scaler 3 failed for CH" << channelId << "qres =" << qres;
     }
 
+    qDebug() << "Trace: onConnected completed successfully!";
     return QCAP_RT_OK;
 }
 
@@ -562,6 +595,7 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
     Q_UNUSED(dSampleTime);
     Q_UNUSED(bIsKeyFrame);
 
+    qDebug() << "Trace: onVideoCallback entry";
     qcap2_video_decoder_t* pLocalVdec = nullptr;
 
     {
@@ -573,19 +607,24 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
     }
 
     qcap2_rcbuffer_t* pRCBuffer = qcap2_rcbuffer_cast(pStreamBuffer, nStreamBufferLen);
-    if (!pRCBuffer) return QCAP_RT_OK;
+    if (!pRCBuffer) {
+        qDebug() << "Trace: onVideoCallback - pRCBuffer is null";
+        return QCAP_RT_OK;
+    }
 
+    qDebug() << "Trace: onVideoCallback - pushing H.264 packet to decoder...";
+    // Push H.264 packet directly to the hardware decoder
     QRESULT qres = qcap2_video_decoder_push(pLocalVdec, pRCBuffer);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qCritical() << "qcap2_video_decoder_push failed for CH" << channelId << "qres =" << qres;
     }
+    qDebug() << "Trace: onVideoCallback finished pushing";
 
     if (!m_pushTimer.isValid()) {
         m_pushTimer.start();
     }
     m_pushFrameCount++;
     if (m_pushTimer.elapsed() >= 2000) {
-        double inputFps = double(m_pushFrameCount) * 1000.0 / double(m_pushTimer.elapsed());
         m_pushFrameCount = 0;
         m_pushTimer.restart();
     }
@@ -594,8 +633,10 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
 }
 
 QRETURN ChannelContext::onEventVdec() {
+    qDebug() << "Trace: onEventVdec entry";
     qcap2_video_decoder_t* pLocalVdec = nullptr;
-    qcap2_video_scaler_t* pLocalScaler = nullptr;
+    qcap2_video_scaler_t* pLocalScaler2 = nullptr;
+    qcap2_video_scaler_t* pLocalScaler3 = nullptr;
     qcap2_video_sink_t* pLocalVideoSink = nullptr;
     bool bDisplayEnabled = false;
     bool bSendBuffer = false;
@@ -604,16 +645,34 @@ QRETURN ChannelContext::onEventVdec() {
         QMutexLocker locker(&m_mutex);
         if (!pVdec) return QCAP_RT_OK;
         pLocalVdec = pVdec;
-        pLocalScaler = pScaler;
+        pLocalScaler2 = pScaler2;
+        pLocalScaler3 = pScaler3;
         pLocalVideoSink = pVideoSink;
         bDisplayEnabled = m_bDisplayEnabled;
         bSendBuffer = m_bSendBuffer;
     }
 
+    qDebug() << "Trace: onEventVdec - popping frame from decoder...";
     qcap2_rcbuffer_t* pRCBuffer_vdec = nullptr;
     QRESULT qres = qcap2_video_decoder_pop(pLocalVdec, &pRCBuffer_vdec);
     if (qres != QCAP_RS_SUCCESSFUL) {
+        qDebug() << "Trace: onEventVdec - pop failed, qres=" << qres;
         return QCAP_RT_OK;
+    }
+    qDebug() << "Trace: onEventVdec - pop succeeded, buffer=" << pRCBuffer_vdec;
+
+    // Print Decoder Output Info
+    static int dec_log_cnt = 0;
+    if (++dec_log_cnt % 30 == 0) {
+        NvBufSurface* pSurface = nullptr;
+        qcap2_rcbuffer_get_nvbuf(pRCBuffer_vdec, &pSurface);
+        PVOID pLockedData = qcap2_rcbuffer_lock_data(pRCBuffer_vdec);
+        qcap2_rcbuffer_unlock_data(pRCBuffer_vdec);
+        qDebug() << "[Decoder Output Info] CH" << channelId 
+                 << "Buffer:" << pRCBuffer_vdec 
+                 << "Is NVBUF:" << (pSurface != nullptr) 
+                 << "NvBufSurface Addr:" << pSurface 
+                 << "Cpu/Locked Addr:" << pLockedData;
     }
 
     // Decoder FPS tracking
@@ -622,102 +681,81 @@ QRETURN ChannelContext::onEventVdec() {
     }
     m_decFrameCount++;
     if (m_fpsTimer.elapsed() >= 2000) {
-        double fps = double(m_decFrameCount) * 1000.0 / double(m_fpsTimer.elapsed());
         m_decFrameCount = 0;
         m_fpsTimer.restart();
     }
 
-    // Scale nvbuf to system memory
-    bool bScalerActive = false;
-    {
-        QMutexLocker locker(&m_mutex);
-        if (pScaler) bScalerActive = true;
-    }
+    // ── AI Frame Capture ────────────────────────────────────────────
+    if (bSendBuffer && g_pMainwindow && g_pMainwindow->ai_running) {
+        double current_time = QCAP_GET_TIME();
+        if ((current_time - m_lastProcessTime) >= FRAME_INTERVAL && !m_bFrameReady) {
+            m_lastProcessTime = current_time;
 
-    if (bScalerActive && pLocalScaler) {
-        qres = qcap2_video_scaler_push(pLocalScaler, pRCBuffer_vdec);
-        qcap2_rcbuffer_release(pRCBuffer_vdec);
+            NvBufSurface* pSurface = nullptr;
+            qcap2_rcbuffer_get_nvbuf(pRCBuffer_vdec, &pSurface);
 
-        if (qres != QCAP_RS_SUCCESSFUL) {
-            return QCAP_RT_OK;
-        }
+            static int qdeep_log_cnt = 0;
+            if (++qdeep_log_cnt % 30 == 0) {
+                qDebug() << "[QDEEP Copy Info] CH" << channelId 
+                         << "Buffer:" << pRCBuffer_vdec 
+                         << "Is NVBUF:" << (pSurface != nullptr) 
+                         << "NvBufSurface Addr:" << pSurface;
+            }
 
-        qcap2_rcbuffer_t* pSysBuffer = nullptr;
-        qres = qcap2_video_scaler_pop(pLocalScaler, &pSysBuffer);
-        if (qres != QCAP_RS_SUCCESSFUL || !pSysBuffer) {
-            return QCAP_RT_OK;
-        }
+            if (pSurface) {
+                // Release the old QDEEP nvbuf buffer reference if there was one
+                if (m_pCurrentAIRCBuffer) {
+                    qcap2_rcbuffer_release(m_pCurrentAIRCBuffer);
+                }
+                // Hold a reference to the new buffer so it is not freed until next frame or shutdown
+                m_pCurrentAIRCBuffer = pRCBuffer_vdec;
+                qcap2_rcbuffer_add_ref(m_pCurrentAIRCBuffer);
 
-        // ── AI Frame Capture ────────────────────────────────────────────
-        if (bSendBuffer && g_pMainwindow && g_pMainwindow->ai_running) {
-            double current_time = QCAP_GET_TIME();
-            if ((current_time - m_lastProcessTime) >= FRAME_INTERVAL && !m_bFrameReady) {
-                m_lastProcessTime = current_time;
+                g_pMainwindow->buffer_vec[channelId] = reinterpret_cast<BYTE*>(pSurface);
+                g_pMainwindow->buffer_len_vec[channelId] = sizeof(NvBufSurface);
 
-                // Get the frame data from the system memory buffer
-                PVOID pLockedData = qcap2_rcbuffer_lock_data(pSysBuffer);
-                if (pLockedData) {
-                    qcap2_av_frame_t* pAVFrame = reinterpret_cast<qcap2_av_frame_t*>(pLockedData);
-
-                    // Get buffer planes and strides
-                    uint8_t* pBuffer[4] = {nullptr};
-                    int pStride[4] = {0};
-                    qcap2_av_frame_get_buffer1(pAVFrame, pBuffer, pStride);
-
-                    ULONG w = m_nVideoWidth;
-                    ULONG h = m_nVideoHeight;
-
-                    // Copy NV12 data directly to the batch buffer (skip m_pAIBuffer intermediate)
-                    if (pBuffer[0] && pStride[0] > 0) {
-                        BYTE* pDstBuf = g_pMainwindow->buffer_vec[channelId];
-                        ULONG totalBytes = (w * h * 3) / 2;
-                        if (pDstBuf) {
-                            int src_pitch_Y = pStride[0];
-                            // Copy Y plane
-                            for (ULONG row = 0; row < h; ++row)
-                                memcpy(pDstBuf + row * w, pBuffer[0] + row * src_pitch_Y, w);
-
-                            // Copy UV plane (interleaved)
-                            if (pBuffer[1] && pStride[1] > 0) {
-                                int src_pitch_UV = pStride[1];
-                                BYTE* pDstUV = pDstBuf + (w * h);
-                                for (ULONG row = 0; row < h / 2; ++row)
-                                    memcpy(pDstUV + row * w, pBuffer[1] + row * src_pitch_UV, w);
-                            }
-                            g_pMainwindow->buffer_len_vec[channelId] = totalBytes;
-                        }
-                    }
-
-                    qcap2_rcbuffer_unlock_data(pSysBuffer);
-
-                    // 標記有新 frame，通知 AI thread
-                    {
-                        std::lock_guard<std::mutex> lock(g_pMainwindow->mtx);
-                        if (!m_bFrameReady) {
-                            m_bFrameReady = true;
-                            g_pMainwindow->ready_count++;
-                            if (g_pMainwindow->ready_count >= g_pMainwindow->active_camera_count)
-                                g_pMainwindow->cv.notify_one();
-                        }
+                // 標記有新 frame，通知 AI thread
+                {
+                    std::lock_guard<std::mutex> lock(g_pMainwindow->mtx);
+                    if (!m_bFrameReady) {
+                        m_bFrameReady = true;
+                        g_pMainwindow->ready_count++;
+                        if (g_pMainwindow->ready_count >= g_pMainwindow->active_camera_count)
+                            g_pMainwindow->cv.notify_one();
                     }
                 }
             }
         }
-
-        // Push to Video Sink
-        bool bSinkActive = false;
-        {
-            QMutexLocker locker(&m_mutex);
-            if (pVideoSink) bSinkActive = true;
-        }
-        if (bDisplayEnabled && bSinkActive && pLocalVideoSink) {
-            qcap2_video_sink_push(pLocalVideoSink, pSysBuffer);
-        }
-
-        qcap2_rcbuffer_release(pSysBuffer);
-    } else {
-        qcap2_rcbuffer_release(pRCBuffer_vdec);
     }
+    // 2. Scaler 3 (NPP: NVBUF to 640x384 SYSBUF)
+    if (pLocalScaler3) {
+        qDebug() << "Trace: onEventVdec - pushing frame to scaler 3...";
+        qres = qcap2_video_scaler_push(pLocalScaler3, pRCBuffer_vdec);
+        if (qres == QCAP_RS_SUCCESSFUL) {
+            qDebug() << "Trace: onEventVdec - scaler 3 push succeeded, popping output...";
+            qcap2_rcbuffer_t* pSysBuffer = nullptr;
+            qres = qcap2_video_scaler_pop(pLocalScaler3, &pSysBuffer);
+            if (qres == QCAP_RS_SUCCESSFUL && pSysBuffer) {
+                // Push to Video Sink
+                bool bSinkActive = false;
+                {
+                    QMutexLocker locker(&m_mutex);
+                    if (pVideoSink) bSinkActive = true;
+                }
+                if (bDisplayEnabled && bSinkActive && pLocalVideoSink) {
+                    qDebug() << "Trace: onEventVdec - pushing to video sink...";
+                    qcap2_video_sink_push(pLocalVideoSink, pSysBuffer);
+                }
+                qcap2_rcbuffer_release(pSysBuffer);
+            } else {
+                qDebug() << "Trace: onEventVdec - scaler 3 pop failed or empty, qres=" << qres;
+            }
+        } else {
+            qDebug() << "Trace: onEventVdec - scaler 3 push failed, qres=" << qres;
+        }
+    }
+
+    qcap2_rcbuffer_release(pRCBuffer_vdec);
 
     {
         QMutexLocker locker(&m_mutex);
@@ -1059,11 +1097,11 @@ void MainWindow::init_models()
 {
     for (int i = 0; i < MAX_BATCH; ++i) {
         box_list_vec[i] = new QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX[BOX_SIZE];
-        buffer_vec[i] = new BYTE[MAX_BUFFER_SIZE]();
+        buffer_vec[i] = nullptr;
         color_space[i] = QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12;
-        width_vec[i] = 1920;
-        height_vec[i] = 1080;
-        buffer_len_vec[i] = MAX_BUFFER_SIZE;
+        width_vec[i] = 640;
+        height_vec[i] = 384;
+        buffer_len_vec[i] = 0;
     }
 
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
@@ -1095,7 +1133,7 @@ void MainWindow::uninit_models()
 
     for (size_t i = 0; i < MAX_BATCH; ++i) {
         if (box_list_vec[i]) { delete[] box_list_vec[i]; box_list_vec[i] = nullptr; }
-        if (buffer_vec[i]) { delete[] buffer_vec[i]; buffer_vec[i] = nullptr; }
+        buffer_vec[i] = nullptr;
     }
 }
 
@@ -1154,8 +1192,8 @@ void MainWindow::ai_inference_thread()
         active_camera_count = 0;
         for (ChannelContext *ctx : channels) {
             if (ctx->m_bSendBuffer && ctx->m_nVideoWidth > 0 && ctx->m_nVideoHeight > 0) {
-                ctx->m_nAIWidth = ctx->m_nVideoWidth;
-                ctx->m_nAIHeight = ctx->m_nVideoHeight;
+                ctx->m_nAIWidth = 640;
+                ctx->m_nAIHeight = 384;
                 active_camera_count++;
             }
         }
@@ -1189,8 +1227,8 @@ void MainWindow::ai_inference_thread()
                 }
             }
             if (ctx && ctx->m_bSendBuffer && ctx->m_nVideoWidth > 0 && ctx->m_nVideoHeight > 0) {
-                width_vec[i] = ctx->m_nVideoWidth;
-                height_vec[i] = ctx->m_nVideoHeight;
+                width_vec[i] = 640;
+                height_vec[i] = 384;
             } else {
                 width_vec[i] = 0;
                 height_vec[i] = 0;

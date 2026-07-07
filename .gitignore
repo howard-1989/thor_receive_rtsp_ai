@@ -1,0 +1,55 @@
+# C/C++ objects and libraries
+*.o
+*.obj
+*.gch
+*.pch
+*.so
+*.so.[0-9]*
+*.a
+*.la
+*.lai
+*.dylib
+*.dll
+*.lib
+
+# Qt/Qmake generated files
+Makefile
+Makefile.*
+*.pro.user
+*.pro.user.*
+.qmake.stash
+.qtc_clangd/
+ui_*.h
+moc_*
+qrc_*.cpp
+*.qrc.depends
+build/
+
+# Executables
+QtQcapMultiClientDemo_17kps/QtQcapMultiClientDemo_17kps
+QtQcapMultiClientDemo_people/QtQcapMultiClientDemo_people
+QtQcapMultiClientDemo_plate/QtQcapMultiClientDemo_plate
+aisamplecode/NetReceiver_multi_17kps/NetReceive_multi
+aisamplecode/NetReceiver_multi_people/NetReceive_multi
+aisamplecode/NetReceiver_multi_plate/NetReceive_multi
+
+# Archive files
+*.zip
+*.tar
+*.tar.gz
+*.tar.xz
+*.7z
+*.rar
+
+# Project specific SDKs and model files (which are large binaries)
+model/
+lib/
+qcap_l4t-r38-2_2_26_6_f4376719e/
+qdeep/
+
+# Developer notes and temporary files
+aaa.txt
+bbb.txt
+*.log
+*~
+.DS_Store
