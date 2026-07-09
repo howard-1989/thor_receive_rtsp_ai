@@ -22,7 +22,7 @@ INCLUDEPATH += \
     ../qdeep/include
 
 QMAKE_LFLAGS += -Wl,-rpath,$$PWD/../lib \
-                -Wl,-rpath,$$PWD/../qdeep/lib
+#                -Wl,-rpath,$$PWD/../qdeep/lib
 
-LIBS += -L$$PWD/../lib -lqcap -lqcap2_rcbuffer
-LIBS += -L$$PWD/../qdeep/lib -lQDEEP
+LIBS += -L$$PWD/../lib -lqcap -lqcap2_rcbuffer -lQDEEP
+#LIBS += -L$$PWD/../qdeep/lib -lQDEEP

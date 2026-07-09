@@ -34,7 +34,7 @@ namespace QDEEP_API {
 
 // ── AI Constants ────────────────────────────────────────────────────────────
 #define BOX_SIZE 100
-#define MAX_BATCH 64
+#define MAX_BATCH 16
 #define MAX_BUFFER_SIZE (1920 * 1080 * 3 / 2)
 #define TARGET_FPS 30.0
 #define FRAME_INTERVAL (1.0 / TARGET_FPS)
@@ -66,7 +66,9 @@ struct ChannelContext {
     qcap2_video_sink_t* pVideoSink;
     qcap2_video_scaler_t* pScaler2;
     qcap2_video_scaler_t* pScaler3;
+    qcap2_rcbuffer_t* m_pScalerBuffers3[8];
     qcap2_rcbuffer_t* m_pCurrentAIRCBuffer;
+    qcap2_rcbuffer_queue_t* m_pAIQueue;      // AI frame queue for pipeline optimization
 
     // Connected format properties
     ULONG m_nVideoWidth;
@@ -141,7 +143,7 @@ public:
     int m_timerId;
     bool m_bFullscreen;
     bool m_bEnableDisplay;
-    static const int MAX_CHANNELS = 64;
+    static const int MAX_CHANNELS = 16;
 
 public:
     void* handle;
