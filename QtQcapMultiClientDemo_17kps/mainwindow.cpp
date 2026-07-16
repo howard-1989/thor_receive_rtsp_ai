@@ -19,183 +19,64 @@
 #include <cmath>
 
 MainWindow *g_pMainwindow = nullptr;
+//arya
+uint32_t count = 0;
+double elapsed = 0.0;
 
 extern "C" {
-    QDEEP_EXT_API QRESULT QDEEP_EXPORT QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(PVOID pDetector, ULONG* pCheckNum);
+QDEEP_EXT_API QRESULT QDEEP_EXPORT QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(PVOID pDetector, ULONG* pCheckNum);
 }
 
-// ── Overlay Widget (Skeleton 17 Keypoints) ──────────────────────────────────
-class OverlayWidget : public QWidget {
-public:
-    OverlayWidget(QWidget *parent = nullptr) : QWidget(parent) {
-        setAttribute(Qt::WA_TransparentForMouseEvents);
-        setAttribute(Qt::WA_TranslucentBackground);
-        setAttribute(Qt::WA_ShowWithoutActivating);
-        setWindowFlags(Qt::Window |
-                       Qt::FramelessWindowHint |
-                       Qt::Tool |
-                       Qt::WindowStaysOnTopHint |
-                       Qt::BypassWindowManagerHint);
-    }
+#include <opencv2/opencv.hpp>
 
-protected:
-    void paintEvent(QPaintEvent *event) override {
-        if (!g_pMainwindow) return;
-        if (!g_pMainwindow->m_bShowOverlay) return;
-
-        QPainter painter(this);
-        painter.setRenderHint(QPainter::Antialiasing);
-
-        // COCO 17 Keypoints connections
-        const std::vector<std::pair<int, int>> connections = {
-            {0, 14}, {0, 13},       // Nose to Eyes
-            {14, 16}, {13, 15},     // Eyes to Ears
-            {4, 1},                 // Shoulder line
-            {4, 5}, {5, 6},         // Left arm
-            {1, 2}, {2, 3},         // Right arm
-            {10, 7},                // Hip line
-            {4, 10}, {1, 7},        // Torso sides
-            {10, 11}, {11, 12},     // Left leg
-            {7, 8}, {8, 9}          // Right leg
-        };
-
-        std::lock_guard<std::mutex> lock(g_pMainwindow->draw_mtx);
-
-        for (int i = 0; i < MainWindow::MAX_CHANNELS; ++i) {
-            // Find the channel context for this index
-            ChannelContext* ctx = nullptr;
-            for (auto* c : g_pMainwindow->channels) {
-                if (c->channelId == i) {
-                    ctx = c;
-                    break;
-                }
-            }
-            if (!ctx || !ctx->m_bSendBuffer || ctx->m_nVideoWidth == 0) continue;
-
-            // Find the corresponding video frame widget
-            QWidget* w = nullptr;
-            for (int fi = 0; fi < g_pMainwindow->videoFrames.size(); ++fi) {
-                if (fi == i) {
-                    w = g_pMainwindow->videoFrames[fi];
-                    break;
-                }
-            }
-            if (!w || !w->isVisible()) continue;
-
-            QPoint globalPos = w->mapToGlobal(QPoint(0, 0));
-            QPoint localPos = this->mapFromGlobal(globalPos);
-
-            double scale_x = (double)w->width() / (double)ctx->m_nAIWidth;
-            double scale_y = (double)w->height() / (double)ctx->m_nAIHeight;
-
-            // Draw camera channel and people count overlay at top-left
-            int people_count = (int)g_pMainwindow->draw_persons[i].size();
-            QString headerText = QString("CH %1 | People: %2").arg(i + 1).arg(people_count);
-
-            painter.setPen(Qt::NoPen);
-            painter.setBrush(QColor(0, 0, 0, 180));
-
-            QFont font = painter.font();
-            font.setPointSize(10);
-            font.setBold(true);
-            painter.setFont(font);
-
-            QRect headerRect = painter.fontMetrics().boundingRect(headerText);
-            headerRect.adjust(-6, -2, 6, 2);
-            headerRect.moveTo(localPos.x() + 10, localPos.y() + 10);
-            painter.drawRoundedRect(headerRect, 4, 4);
-
-            painter.setPen(QColor(0, 255, 200));
-            painter.drawText(headerRect, Qt::AlignCenter, headerText);
-
-            // Draw skeleton for each person
-            for (const auto& person : g_pMainwindow->draw_persons[i]) {
-                const float kpt_thresh = 0.3f;
-                QPoint mapped_kpts[17];
-                bool kpt_valid[17] = {false};
-
-                for (int k = 0; k < 17; ++k) {
-                    if (person.keypoints[k].probability >= kpt_thresh) {
-                        int px = localPos.x() + (int)(person.keypoints[k].x * scale_x);
-                        int py = localPos.y() + (int)(person.keypoints[k].y * scale_y);
-                        mapped_kpts[k] = QPoint(px, py);
-                        kpt_valid[k] = true;
-                    }
-                }
-
-                // Draw skeleton lines
-                QPen linePen;
-                linePen.setWidth(3);
-
-                for (const auto& conn : connections) {
-                    int p1 = conn.first;
-                    int p2 = conn.second;
-                    if (kpt_valid[p1] && kpt_valid[p2]) {
-                        QColor connColor;
-                        if (p1 == 0 || p2 == 0 || p1 >= 13 || p2 >= 13) {
-                            connColor = QColor(255, 235, 59); // Yellow for face
-                        } else if (p1 == 4 || p1 == 5 || p1 == 6 || p1 == 10 || p1 == 11 || p1 == 12 ||
-                                   p2 == 4 || p2 == 5 || p2 == 6 || p2 == 10 || p2 == 11 || p2 == 12) {
-                            connColor = QColor(0, 229, 255); // Cyan for left side
-                        } else {
-                            connColor = QColor(255, 20, 147); // Neon pink for right side
-                        }
-
-                        linePen.setColor(connColor);
-                        painter.setPen(linePen);
-                        painter.drawLine(mapped_kpts[p1], mapped_kpts[p2]);
-                    }
-                }
-
-                // Draw joint points
-                for (int k = 0; k < 17; ++k) {
-                    if (kpt_valid[k]) {
-                        QColor jointColor;
-                        if (k == 0 || k >= 13) {
-                            jointColor = QColor(255, 255, 0); // Yellow (Face)
-                        } else if (k == 4 || k == 5 || k == 6 || k == 10 || k == 11 || k == 12) {
-                            jointColor = QColor(0, 255, 255); // Cyan (Left side)
-                        } else {
-                            jointColor = QColor(255, 0, 128); // Pink/Red (Right side)
-                        }
-
-                        painter.setPen(QPen(Qt::white, 1));
-                        painter.setBrush(jointColor);
-                        painter.drawEllipse(mapped_kpts[k], 4, 4);
-                    }
-                }
-            }
-        }
-    }
+// COCO 17 Keypoints connections
+const std::vector<std::pair<int, int>> connections = {
+    {0, 14}, {0, 13},       // Nose to Eyes
+    {14, 16}, {13, 15},     // Eyes to Ears
+    {4, 1},                 // Shoulder line
+    {4, 5}, {5, 6},         // Left arm
+    {1, 2}, {2, 3},         // Right arm
+    {10, 7},                // Hip line
+    {4, 10}, {1, 7},        // Torso sides
+    {10, 11}, {11, 12},     // Left leg
+    {7, 8}, {8, 9}          // Right leg
 };
+
+QImage cvMatToQImage(const cv::Mat& mat) {
+    if (mat.type() == CV_8UC3) {
+        return QImage(mat.data, mat.cols, mat.rows, mat.step, QImage::Format_RGB888).rgbSwapped().copy();
+    }
+    return QImage();
+}
+
 
 // ── Static callback functions delegating to ChannelContext ──────────────────
 static QRETURN on_connected_callback(
-    PVOID  pClient,
-    UINT   iSessionNum,
-    ULONG  nVideoEncoderFormat,
-    ULONG  nVideoWidth,
-    ULONG  nVideoHeight,
-    BOOL   bVideoIsInterleaved,
-    double dVideoFrameRate,
-    ULONG  nAudioEncoderFormat,
-    ULONG  nAudioChannels,
-    ULONG  nAudioBitsPerSample,
-    ULONG  nAudioSampleFrequency,
-    PVOID  pUserData)
+        PVOID  pClient,
+        UINT   iSessionNum,
+        ULONG  nVideoEncoderFormat,
+        ULONG  nVideoWidth,
+        ULONG  nVideoHeight,
+        BOOL   bVideoIsInterleaved,
+        double dVideoFrameRate,
+        ULONG  nAudioEncoderFormat,
+        ULONG  nAudioChannels,
+        ULONG  nAudioBitsPerSample,
+        ULONG  nAudioSampleFrequency,
+        PVOID  pUserData)
 {
     ChannelContext* ctx = static_cast<ChannelContext*>(pUserData);
     return ctx->onConnected(pClient, iSessionNum, nVideoEncoderFormat, nVideoWidth, nVideoHeight, bVideoIsInterleaved, dVideoFrameRate);
 }
 
 static QRETURN on_video_callback(
-    PVOID pClient,
-    UINT iSessionNum,
-    double dSampleTime,
-    BYTE * pStreamBuffer,
-    ULONG nStreamBufferLen,
-    BOOL bIsKeyFrame,
-    PVOID pUserData)
+        PVOID pClient,
+        UINT iSessionNum,
+        double dSampleTime,
+        BYTE * pStreamBuffer,
+        ULONG nStreamBufferLen,
+        BOOL bIsKeyFrame,
+        PVOID pUserData)
 {
     ChannelContext* ctx = static_cast<ChannelContext*>(pUserData);
     return ctx->onVideoCallback(dSampleTime, pStreamBuffer, nStreamBufferLen, bIsKeyFrame);
@@ -206,11 +87,22 @@ static QRETURN on_event_vdec_callback(PVOID pUserData) {
     return ctx->onEventVdec();
 }
 
+static QRETURN on_fail_callback(
+        PVOID pClient,
+        UINT iSessionNum,
+        QRESULT nErrorStatus,
+        DWORD nErrorCode,
+        PVOID pUserData)
+{
+    ChannelContext* ctx = static_cast<ChannelContext*>(pUserData);
+    return ctx->onFail(iSessionNum, nErrorStatus, nErrorCode);
+}
+
 // ── ChannelContext Implementation ───────────────────────────────────────────
-ChannelContext::ChannelContext(int id, const QString& streamUrl, uintptr_t winId)
-    : channelId(id), url(streamUrl), m_winId(winId),
+ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
+    : channelId(id), url(streamUrl), m_pLabel(pLabel),
       pClient(nullptr), pVdec(nullptr), pEventHandlers(nullptr),
-      pEvent_vdec(nullptr), pVideoSink(nullptr),
+      pEvent_vdec(nullptr),
       pScaler2(nullptr), pScaler3(nullptr), m_pAIQueue(nullptr),
       m_pCurrentAIRCBuffer(nullptr),
       m_nVideoWidth(0), m_nVideoHeight(0), m_dVideoFrameRate(0.0), m_nVideoEncoderFormat(0),
@@ -220,10 +112,13 @@ ChannelContext::ChannelContext(int id, const QString& streamUrl, uintptr_t winId
       m_bSendBuffer(false), m_lastProcessTime(0.0), m_bFrameReady(false),
       m_pAIBuffer(nullptr), m_nAIBufferLen(0), m_nAIWidth(0), m_nAIHeight(0)
 {
+    m_pPendingUpdate = std::make_shared<std::atomic<bool>>(false);
+    m_displayFrameCount = 0;
     for (int i = 0; i < 8; ++i) {
         m_pScalerBuffers3[i] = nullptr;
     }
 }
+
 
 ChannelContext::~ChannelContext() {
     if (m_pAIBuffer) {
@@ -260,9 +155,10 @@ bool ChannelContext::start() {
     // Register connected and raw stream callbacks
     QCAP_REGISTER_BROADCAST_CLIENT_CONNECTED_CALLBACK(pClient, on_connected_callback, this);
     QCAP_REGISTER_VIDEO_BROADCAST_CLIENT_CALLBACK(pClient, on_video_callback, this);
+    QCAP_REGISTER_BROADCAST_CLIENT_FAIL_CALLBACK(pClient, on_fail_callback, this);
 
     // Start stream receiver (TCP mode for RTSP)
-    qres = QCAP_START_BROADCAST_CLIENT(pClient, QCAP_BROADCAST_PROTOCOL_TCP, 10000, -1);
+    qres = QCAP_START_BROADCAST_CLIENT(pClient, QCAP_BROADCAST_PROTOCOL_TCP, 10000, 0);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qCritical() << "QCAP_START_BROADCAST_CLIENT failed for CH" << channelId << "qres =" << qres;
         QCAP_DESTROY_BROADCAST_CLIENT(pClient);
@@ -273,148 +169,159 @@ bool ChannelContext::start() {
     return true;
 }
 
-void ChannelContext::stop() {
-    PVOID pLocalClient = nullptr;
+void ChannelContext::cleanupPipeline() {
     qcap2_event_handlers_t* pLocalEventHandlers = nullptr;
     qcap2_video_scaler_t* pLocalScaler2 = nullptr;
     qcap2_video_scaler_t* pLocalScaler3 = nullptr;
     qcap2_video_decoder_t* pLocalVdec = nullptr;
-    qcap2_video_sink_t* pLocalVideoSink = nullptr;
     qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
+    qcap2_event_t* pLocalEvent_vdec = nullptr;
+    qcap2_rcbuffer_t* pLocalCurrentAIRCBuffer = nullptr;
+    qcap2_rcbuffer_t* pLocalScalerBuffers3[8] = {nullptr};
 
     {
         QMutexLocker locker(&m_mutex);
-        pLocalClient = pClient;
         pLocalEventHandlers = pEventHandlers;
         pLocalScaler2 = pScaler2;
         pLocalScaler3 = pScaler3;
         pLocalVdec = pVdec;
-        pLocalVideoSink = pVideoSink;
         pLocalAIQueue = m_pAIQueue;
+        pLocalEvent_vdec = pEvent_vdec;
+        pLocalCurrentAIRCBuffer = m_pCurrentAIRCBuffer;
+        for (int i = 0; i < 8; ++i) {
+            pLocalScalerBuffers3[i] = m_pScalerBuffers3[i];
+            m_pScalerBuffers3[i] = nullptr;
+        }
 
-        pClient = nullptr;
         pEventHandlers = nullptr;
         pScaler2 = nullptr;
         pScaler3 = nullptr;
         pVdec = nullptr;
-        pVideoSink = nullptr;
         m_pAIQueue = nullptr;
+        pEvent_vdec = nullptr;
+        m_pCurrentAIRCBuffer = nullptr;
     }
 
-    qDebug() << "========== CH" << channelId << "Stop Sequence Started ==========";
+    qDebug() << "========== CH" << channelId << "Pipeline Cleanup Started ==========";
 
-    if (pLocalClient) {
-        qDebug() << "CH" << channelId << "stop: Calling QCAP_STOP_BROADCAST_CLIENT...";
-        QCAP_STOP_BROADCAST_CLIENT(pLocalClient);
-        qDebug() << "CH" << channelId << "stop: QCAP_STOP_BROADCAST_CLIENT finished.";
-    }
-    if (pLocalVdec) {
-        qDebug() << "CH" << channelId << "stop: Calling qcap2_video_decoder_stop...";
-        qcap2_video_decoder_stop(pLocalVdec);
-        qDebug() << "CH" << channelId << "stop: qcap2_video_decoder_stop finished.";
-    }
     uintptr_t nHandle_vdec = 0;
-    if (pEvent_vdec) {
-        qDebug() << "CH" << channelId << "stop: Stopping pEvent_vdec...";
-        qcap2_event_get_native_handle(pEvent_vdec, &nHandle_vdec);
-        qcap2_event_stop(pEvent_vdec);
-        qDebug() << "CH" << channelId << "stop: pEvent_vdec stop finished.";
+    if (pLocalEvent_vdec) {
+        qcap2_event_get_native_handle(pLocalEvent_vdec, &nHandle_vdec);
     }
+
+    // 1. Stop the decoder first to unblock any active pop/push operations in other threads
+    if (pLocalVdec) {
+        qDebug() << "CH" << channelId << "cleanup: Calling qcap2_video_decoder_stop...";
+        qcap2_video_decoder_stop(pLocalVdec);
+    }
+
+    // 2. Stop the event object
+    if (pLocalEvent_vdec) {
+        qDebug() << "CH" << channelId << "cleanup: Stopping pEvent_vdec...";
+        qcap2_event_stop(pLocalEvent_vdec);
+    }
+
+    // 3. Stop the event handlers (the loop thread will exit immediately since pop is unblocked)
     if (pLocalEventHandlers) {
-        if (nHandle_vdec != 0) {
-            qDebug() << "CH" << channelId << "stop: Removing event handler...";
-            qcap2_event_handlers_remove_handler(pLocalEventHandlers, nHandle_vdec);
-        }
-        qDebug() << "CH" << channelId << "stop: Stopping event handlers...";
+        qDebug() << "CH" << channelId << "cleanup: Stopping event handlers...";
         qcap2_event_handlers_stop(pLocalEventHandlers);
-        qDebug() << "CH" << channelId << "stop: Event handlers stop finished.";
     }
-    if (pLocalVideoSink) {
-        qDebug() << "CH" << channelId << "stop: Stopping video sink...";
-        qcap2_video_sink_stop(pLocalVideoSink);
-        qDebug() << "CH" << channelId << "stop: Video sink stop finished.";
-    }
+
+    // 4. Stop the scalers
     if (pLocalScaler2) {
-        qDebug() << "CH" << channelId << "stop: Stopping Scaler 2...";
+        qDebug() << "CH" << channelId << "cleanup: Stopping Scaler 2...";
         qcap2_video_scaler_stop(pLocalScaler2);
-        qDebug() << "CH" << channelId << "stop: Scaler 2 stop finished.";
     }
     if (pLocalScaler3) {
-        qDebug() << "CH" << channelId << "stop: Stopping Scaler 3...";
+        qDebug() << "CH" << channelId << "cleanup: Stopping Scaler 3...";
         qcap2_video_scaler_stop(pLocalScaler3);
-        qDebug() << "CH" << channelId << "stop: Scaler 3 stop finished.";
     }
+
+    // 5. Stop the AI Queue
     if (pLocalAIQueue) {
-        qDebug() << "CH" << channelId << "stop: Draining and stopping AI Queue...";
+        qDebug() << "CH" << channelId << "cleanup: Draining and stopping AI Queue...";
         qcap2_rcbuffer_t* pBuf = nullptr;
         while (qcap2_rcbuffer_queue_pop(pLocalAIQueue, &pBuf) == QCAP_RS_SUCCESSFUL && pBuf) {
             qcap2_rcbuffer_release(pBuf);
         }
         qcap2_rcbuffer_queue_stop(pLocalAIQueue);
-        qDebug() << "CH" << channelId << "stop: AI Queue stopped.";
     }
 
-    // Release CPU buffers allocated for Scaler 2 (pScaler3)
-    qDebug() << "CH" << channelId << "stop: Releasing Scaler 3 CPU buffers...";
+    qDebug() << "CH" << channelId << "cleanup: Releasing Scaler 3 CPU buffers...";
     for (int i = 0; i < 8; ++i) {
-        if (m_pScalerBuffers3[i]) {
-            qcap2_rcbuffer_release(m_pScalerBuffers3[i]);
-            m_pScalerBuffers3[i] = nullptr;
+        if (pLocalScalerBuffers3[i]) {
+            qcap2_rcbuffer_release(pLocalScalerBuffers3[i]);
         }
     }
-    qDebug() << "CH" << channelId << "stop: Scaler 3 CPU buffers released.";
 
-    if (pLocalVideoSink) {
-        qDebug() << "CH" << channelId << "stop: Deleting video sink...";
-        qcap2_video_sink_delete(pLocalVideoSink);
-        qDebug() << "CH" << channelId << "stop: Video sink deleted.";
-    }
     if (pLocalScaler2) {
-        qDebug() << "CH" << channelId << "stop: Deleting Scaler 2...";
+        qDebug() << "CH" << channelId << "cleanup: Deleting Scaler 2...";
         qcap2_video_scaler_delete(pLocalScaler2);
-        qDebug() << "CH" << channelId << "stop: Scaler 2 deleted.";
     }
     if (pLocalScaler3) {
-        qDebug() << "CH" << channelId << "stop: Deleting Scaler 3...";
+        qDebug() << "CH" << channelId << "cleanup: Deleting Scaler 3...";
         qcap2_video_scaler_delete(pLocalScaler3);
-        qDebug() << "CH" << channelId << "stop: Scaler 3 deleted.";
     }
     if (pLocalAIQueue) {
-        qDebug() << "CH" << channelId << "stop: Deleting AI Queue...";
+        qDebug() << "CH" << channelId << "cleanup: Deleting AI Queue...";
         qcap2_rcbuffer_queue_delete(pLocalAIQueue);
-        qDebug() << "CH" << channelId << "stop: AI Queue deleted.";
     }
     if (pLocalVdec) {
-        qDebug() << "CH" << channelId << "stop: Deleting video decoder...";
+        qDebug() << "CH" << channelId << "cleanup: Deleting video decoder...";
         qcap2_video_decoder_delete(pLocalVdec);
-        qDebug() << "CH" << channelId << "stop: Video decoder deleted.";
     }
     if (pLocalEventHandlers) {
-        qDebug() << "CH" << channelId << "stop: Deleting event handlers...";
+        qDebug() << "CH" << channelId << "cleanup: Deleting event handlers...";
         qcap2_event_handlers_delete(pLocalEventHandlers);
-        qDebug() << "CH" << channelId << "stop: Event handlers deleted.";
     }
-    if (pEvent_vdec) {
-        qDebug() << "CH" << channelId << "stop: Deleting event vdec...";
-        qcap2_event_stop(pEvent_vdec);
-        qcap2_event_delete(pEvent_vdec);
-        pEvent_vdec = nullptr;
-        qDebug() << "CH" << channelId << "stop: Event vdec deleted.";
+    if (pLocalEvent_vdec) {
+        qDebug() << "CH" << channelId << "cleanup: Deleting event vdec...";
+        qcap2_event_delete(pLocalEvent_vdec);
     }
+    if (pLocalCurrentAIRCBuffer) {
+        qDebug() << "CH" << channelId << "cleanup: Releasing m_pCurrentAIRCBuffer...";
+        qcap2_rcbuffer_release(pLocalCurrentAIRCBuffer);
+    }
+
+    qDebug() << "========== CH" << channelId << "Pipeline Cleanup Finished ==========";
+}
+
+void ChannelContext::stop() {
+    PVOID pLocalClient = nullptr;
+    {
+        QMutexLocker locker(&m_mutex);
+        pLocalClient = pClient;
+        pClient = nullptr;
+    }
+
+    qDebug() << "========== CH" << channelId << "Stop Sequence Started ==========";
+
+    // 1. Stop the broadcast client first to stop receiving raw stream packets
+    if (pLocalClient) {
+        qDebug() << "CH" << channelId << "stop: Stopping broadcast client...";
+        QCAP_STOP_BROADCAST_CLIENT(pLocalClient);
+        qDebug() << "CH" << channelId << "stop: Broadcast client stopped.";
+    }
+
+    // 2. Clean up the decoding pipeline safely
+    cleanupPipeline();
+
+    // 3. Destroy the broadcast client
     if (pLocalClient) {
         qDebug() << "CH" << channelId << "stop: Destroying broadcast client...";
         QCAP_DESTROY_BROADCAST_CLIENT(pLocalClient);
         qDebug() << "CH" << channelId << "stop: Broadcast client destroyed.";
     }
 
-    if (m_pCurrentAIRCBuffer) {
-        qDebug() << "CH" << channelId << "stop: Releasing m_pCurrentAIRCBuffer...";
-        qcap2_rcbuffer_release(m_pCurrentAIRCBuffer);
-        m_pCurrentAIRCBuffer = nullptr;
-        qDebug() << "CH" << channelId << "stop: m_pCurrentAIRCBuffer released.";
-    }
-
     qDebug() << "========== CH" << channelId << "Stop Sequence Finished ==========";
+}
+
+QRETURN ChannelContext::onFail(UINT iSessionNum, QRESULT nErrorStatus, DWORD nErrorCode) {
+    Q_UNUSED(iSessionNum);
+    QMutexLocker locker(&m_mutex);
+    qCritical() << "CH" << channelId << "Broadcast client failure callback! Status:" << nErrorStatus << "Code:" << nErrorCode;
+    m_statusInfo = QString("Disconnected (Error 0x%1)").arg(nErrorStatus, 8, 16, QChar('0'));
+    return QCAP_RT_OK;
 }
 
 void ChannelContext::setDisplayEnabled(bool enabled) {
@@ -423,16 +330,28 @@ void ChannelContext::setDisplayEnabled(bool enabled) {
 }
 
 QRETURN ChannelContext::onConnected(
-    PVOID pClient,
-    UINT iSessionNum,
-    ULONG nVideoEncoderFormat,
-    ULONG nVideoWidth,
-    ULONG nVideoHeight,
-    BOOL bVideoIsInterleaved,
-    double dVideoFrameRate)
+        PVOID pClient,
+        UINT iSessionNum,
+        ULONG nVideoEncoderFormat,
+        ULONG nVideoWidth,
+        ULONG nVideoHeight,
+        BOOL bVideoIsInterleaved,
+        double dVideoFrameRate)
 {
     Q_UNUSED(pClient);
     Q_UNUSED(iSessionNum);
+
+    bool need_cleanup = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        if (pVdec || pEventHandlers) {
+            need_cleanup = true;
+        }
+    }
+    if (need_cleanup) {
+        qDebug() << "CH" << channelId << "Reconnecting: Cleaning up previous pipeline...";
+        cleanupPipeline();
+    }
 
     QMutexLocker locker(&m_mutex);
 
@@ -449,16 +368,16 @@ QRETURN ChannelContext::onConnected(
 
     QString formatStr;
     switch (nVideoEncoderFormat) {
-        case QCAP_ENCODER_FORMAT_H264: formatStr = "H.264"; break;
-        case QCAP_ENCODER_FORMAT_H265: formatStr = "H.265"; break;
-        case QCAP_ENCODER_FORMAT_AV1:  formatStr = "AV1"; break;
-        case QCAP_ENCODER_FORMAT_MPEG2: formatStr = "MPEG2"; break;
-        case QCAP_ENCODER_FORMAT_RAW:  formatStr = "RAW"; break;
-        default: formatStr = QString("Unknown (%1)").arg(nVideoEncoderFormat); break;
+    case QCAP_ENCODER_FORMAT_H264: formatStr = "H.264"; break;
+    case QCAP_ENCODER_FORMAT_H265: formatStr = "H.265"; break;
+    case QCAP_ENCODER_FORMAT_AV1:  formatStr = "AV1"; break;
+    case QCAP_ENCODER_FORMAT_MPEG2: formatStr = "MPEG2"; break;
+    case QCAP_ENCODER_FORMAT_RAW:  formatStr = "RAW"; break;
+    default: formatStr = QString("Unknown (%1)").arg(nVideoEncoderFormat); break;
     }
 
     m_statusInfo = QString("%1x%2 @%3fps (%4)")
-                   .arg(nVideoWidth).arg(nVideoHeight).arg(dVideoFrameRate).arg(formatStr);
+            .arg(nVideoWidth).arg(nVideoHeight).arg(dVideoFrameRate).arg(formatStr);
 
     qDebug() << "CH" << channelId << "Connected info:" << m_statusInfo;
 
@@ -527,13 +446,13 @@ QRETURN ChannelContext::onConnected(
 
     qDebug() << "Trace: Setting property1 on property object...";
     qcap2_video_encoder_property_set_property1(pProp,
-        0,
-        QCAP_ENCODER_TYPE_NVIDIA_NVENC,
-        nVideoEncoderFormat,
-        QCAP_COLORSPACE_TYPE_NV12,
-        nVideoWidth, nVideoHeight, dVideoFrameRate,
-        QCAP_RECORD_PROFILE_MAIN, QCAP_RECORD_LEVEL_51, QCAP_RECORD_ENTROPY_CABAC, QCAP_RECORD_COMPLEXITY_0, QCAP_RECORD_MODE_CBR,
-        8000, 40000000, 60, 0, FALSE, 0, 0, 0, FALSE, FALSE, FALSE, 0, 0, 0, 0, 0, 0);
+                                               0,
+                                               QCAP_ENCODER_TYPE_NVIDIA_NVENC,
+                                               nVideoEncoderFormat,
+                                               QCAP_COLORSPACE_TYPE_NV12,
+                                               nVideoWidth, nVideoHeight, dVideoFrameRate,
+                                               QCAP_RECORD_PROFILE_MAIN, QCAP_RECORD_LEVEL_51, QCAP_RECORD_ENTROPY_CABAC, QCAP_RECORD_COMPLEXITY_0, QCAP_RECORD_MODE_CBR,
+                                               8000, 40000000, 60, 0, FALSE, 0, 0, 0, FALSE, FALSE, FALSE, 0, 0, 0, 0, 0, 0);
     qcap2_video_encoder_property_set_high_perf(pProp, TRUE);
     qDebug() << "Trace: Setting video property on decoder...";
     qcap2_video_decoder_set_video_property(pVdec, pProp);
@@ -562,57 +481,11 @@ QRETURN ChannelContext::onConnected(
         return QCAP_RT_OK;
     }
 
-    qDebug() << "Trace: Creating video sink...";
-    // Initialize Video Sink
-    pVideoSink = qcap2_video_sink_new();
-    if (!pVideoSink) {
-        qCritical() << "CH" << channelId << "Failed to create video sink.";
-        m_statusInfo = "Error: Failed to create video sink";
-        qcap2_video_decoder_delete(pVdec);
-        pVdec = nullptr;
-        qcap2_event_handlers_remove_handler(pEventHandlers, nHandle_vdec);
-        qcap2_event_handlers_stop(pEventHandlers);
-        qcap2_event_handlers_delete(pEventHandlers);
-        pEventHandlers = nullptr;
-        qcap2_event_stop(pEvent_vdec);
-        qcap2_event_delete(pEvent_vdec);
-        pEvent_vdec = nullptr;
-        return QCAP_RT_OK;
-    }
-
-    qDebug() << "Trace: Setting video sink properties...";
-    int backendType = QCAP2_VIDEO_SINK_BACKEND_TYPE_DAVMF;
-
-    qcap2_video_sink_set_backend_type(pVideoSink, backendType);
-    qcap2_video_sink_set_native_handle(pVideoSink, m_winId);
-
-    if (m_bDisplayEnabled) {
-        qcap2_video_sink_set_nvbuf(pVideoSink, false);
-    }
-
-    qcap2_video_format_t* pFormat = qcap2_video_format_new();
-    if (pFormat) {
-        qcap2_video_format_set_property(pFormat, QCAP_COLORSPACE_TYPE_NV12, 640, 384, bVideoIsInterleaved, dVideoFrameRate);
-        qcap2_video_sink_set_video_format(pVideoSink, pFormat);
-        qcap2_video_format_delete(pFormat);
-    }
-
-    if (m_bDisplayEnabled) {
-        qDebug() << "Trace: Starting video sink...";
-        qres = qcap2_video_sink_start(pVideoSink);
-        if (qres != QCAP_RS_SUCCESSFUL) {
-            qCritical() << "qcap2_video_sink_start failed for CH" << channelId << "qres =" << qres;
-        }
-    }
-
     qDebug() << "Trace: Creating video scaler 2 (Scaler 2)...";
     pScaler2 = qcap2_video_scaler_new();
     if (!pScaler2) {
         qCritical() << "CH" << channelId << "Failed to create video scaler 2.";
         m_statusInfo = "Error: Failed to create video scaler 2";
-        qcap2_video_sink_stop(pVideoSink);
-        qcap2_video_sink_delete(pVideoSink);
-        pVideoSink = nullptr;
         qcap2_video_decoder_stop(pVdec);
         qcap2_video_decoder_delete(pVdec);
         pVdec = nullptr;
@@ -633,9 +506,6 @@ QRETURN ChannelContext::onConnected(
         m_statusInfo = "Error: Failed to create video scaler 3";
         qcap2_video_scaler_delete(pScaler2);
         pScaler2 = nullptr;
-        qcap2_video_sink_stop(pVideoSink);
-        qcap2_video_sink_delete(pVideoSink);
-        pVideoSink = nullptr;
         qcap2_video_decoder_stop(pVdec);
         qcap2_video_decoder_delete(pVdec);
         pVdec = nullptr;
@@ -721,7 +591,7 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
     Q_UNUSED(dSampleTime);
     Q_UNUSED(bIsKeyFrame);
 
-//    qDebug() << "Trace: onVideoCallback entry";
+    //    qDebug() << "Trace: onVideoCallback entry";
     qcap2_video_decoder_t* pLocalVdec = nullptr;
 
     {
@@ -738,13 +608,13 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
         return QCAP_RT_OK;
     }
 
-//    qDebug() << "Trace: onVideoCallback - pushing H.264 packet to decoder...";
+    //    qDebug() << "Trace: onVideoCallback - pushing H.264 packet to decoder...";
     // Push H.264 packet directly to the hardware decoder
     QRESULT qres = qcap2_video_decoder_push(pLocalVdec, pRCBuffer);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qCritical() << "qcap2_video_decoder_push failed for CH" << channelId << "qres =" << qres;
     }
-//    qDebug() << "Trace: onVideoCallback finished pushing";
+    //    qDebug() << "Trace: onVideoCallback finished pushing";
 
     if (!m_pushTimer.isValid()) {
         m_pushTimer.start();
@@ -759,11 +629,10 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
 }
 
 QRETURN ChannelContext::onEventVdec() {
-//    qDebug() << "Trace: onEventVdec entry for CH" << channelId;
+    //    qDebug() << "Trace: onEventVdec entry for CH" << channelId;
     qcap2_video_decoder_t* pLocalVdec = nullptr;
     qcap2_video_scaler_t* pLocalScaler2 = nullptr;
     qcap2_video_scaler_t* pLocalScaler3 = nullptr;
-    qcap2_video_sink_t* pLocalVideoSink = nullptr;
     bool bDisplayEnabled = false;
     bool bSendBuffer = false;
     qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
@@ -774,20 +643,19 @@ QRETURN ChannelContext::onEventVdec() {
         pLocalVdec = pVdec;
         pLocalScaler2 = pScaler2;
         pLocalScaler3 = pScaler3;
-        pLocalVideoSink = pVideoSink;
         bDisplayEnabled = m_bDisplayEnabled;
         bSendBuffer = m_bSendBuffer;
         pLocalAIQueue = m_pAIQueue;
     }
 
-//    qDebug() << "Trace: onEventVdec - popping frame from decoder...";
+    //    qDebug() << "Trace: onEventVdec - popping frame from decoder...";
     qcap2_rcbuffer_t* pRCBuffer_vdec = nullptr;
     QRESULT qres = qcap2_video_decoder_pop(pLocalVdec, &pRCBuffer_vdec);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qDebug() << "Trace: onEventVdec - pop failed, qres=" << qres;
         return QCAP_RT_OK;
     }
-//    qDebug() << "Trace: onEventVdec - pop succeeded, buffer=" << pRCBuffer_vdec;
+    //    qDebug() << "Trace: onEventVdec - pop succeeded, buffer=" << pRCBuffer_vdec;
 
     // Print Decoder Output Info
     static int dec_log_cnt = 0;
@@ -796,11 +664,11 @@ QRETURN ChannelContext::onEventVdec() {
         qcap2_rcbuffer_get_nvbuf(pRCBuffer_vdec, &pSurface);
         PVOID pLockedData = qcap2_rcbuffer_lock_data(pRCBuffer_vdec);
         qcap2_rcbuffer_unlock_data(pRCBuffer_vdec);
-//      qDebug() << "[Decoder Output Info] CH" << channelId
-//                 << "Buffer:" << pRCBuffer_vdec
-//                 << "Is NVBUF:" << (pSurface != nullptr)
-//                 << "NvBufSurface Addr:" << pSurface
-//                 << "Cpu/Locked Addr:" << pLockedData;
+        //      qDebug() << "[Decoder Output Info] CH" << channelId
+        //                 << "Buffer:" << pRCBuffer_vdec
+        //                 << "Is NVBUF:" << (pSurface != nullptr)
+        //                 << "NvBufSurface Addr:" << pSurface
+        //                 << "Cpu/Locked Addr:" << pLockedData;
     }
 
     // Decoder FPS tracking
@@ -813,25 +681,12 @@ QRETURN ChannelContext::onEventVdec() {
         m_fpsTimer.restart();
     }
 
-    bool bDumpThisFrame = false;
-    {
-        static int totalFrameCount[16] = {0};
-        if (channelId < 16) {
-            totalFrameCount[channelId]++;
-//            qDebug() << "Trace: onEventVdec - CH" << channelId << "FrameCount =" << totalFrameCount[channelId];
-            if (totalFrameCount[channelId] == 30) {
-                bDumpThisFrame = true;
-//                qDebug() << "Trace: onEventVdec - CH" << channelId << "bDumpThisFrame is set to true!";
-            }
-        }
-    }
-
     qcap2_rcbuffer_t* pScaledBuffer_nvbuf = nullptr;
     if (pLocalScaler2) {
-//        qDebug() << "Trace: onEventVdec - pushing 1920x1080 nvbuf to scaler 1 (pScaler2)...";
+        //        qDebug() << "Trace: onEventVdec - pushing 1920x1080 nvbuf to scaler 1 (pScaler2)...";
         qres = qcap2_video_scaler_push(pLocalScaler2, pRCBuffer_vdec);
         if (qres == QCAP_RS_SUCCESSFUL) {
-//            qDebug() << "Trace: onEventVdec - scaler 1 push succeeded, popping output...";
+            //            qDebug() << "Trace: onEventVdec - scaler 1 push succeeded, popping output...";
             qres = qcap2_video_scaler_pop(pLocalScaler2, &pScaledBuffer_nvbuf);
             if (qres != QCAP_RS_SUCCESSFUL || !pScaledBuffer_nvbuf) {
                 qDebug() << "Trace: onEventVdec - scaler 1 pop failed, qres=" << qres;
@@ -843,10 +698,10 @@ QRETURN ChannelContext::onEventVdec() {
 
     // 2. Scaler 2 (NPP: 640x384 NVBUF to 640x384 SYSBUF)
     if (pLocalScaler3 && pScaledBuffer_nvbuf) {
-//        qDebug() << "Trace: onEventVdec - pushing 640x384 nvbuf to scaler 3 (pScaler3)...";
+        //        qDebug() << "Trace: onEventVdec - pushing 640x384 nvbuf to scaler 3 (pScaler3)...";
         qres = qcap2_video_scaler_push(pLocalScaler3, pScaledBuffer_nvbuf);
         if (qres == QCAP_RS_SUCCESSFUL) {
-//            qDebug() << "Trace: onEventVdec - scaler 3 push succeeded, popping output...";
+            //            qDebug() << "Trace: onEventVdec - scaler 3 push succeeded, popping output...";
             qcap2_rcbuffer_t* pSysBuffer = nullptr;
             qres = qcap2_video_scaler_pop(pLocalScaler3, &pSysBuffer);
             if (qres == QCAP_RS_SUCCESSFUL && pSysBuffer) {
@@ -873,59 +728,6 @@ QRETURN ChannelContext::onEventVdec() {
                         // Notify AI thread that new frame is available
                         g_pMainwindow->cv.notify_one();
                     }
-                }
-//                if (bDumpThisFrame) {
-//                    qcap2_av_frame_t* pAVFrame = (qcap2_av_frame_t*)qcap2_rcbuffer_lock_data(pSysBuffer);
-//                    if (pAVFrame) {
-//                        NvBufSurface* pSurface = nullptr;
-//                        qcap2_rcbuffer_get_nvbuf(pSysBuffer, &pSurface);
-//                        if (pSurface) {
-//                            qDebug() << "Trace: onEventVdec - Mapping NVBUF output for CPU access...";
-//                            qcap2_rcbuffer_map_nvbuf(pSysBuffer, NVBUF_MAP_READ);
-//                        }
-
-//                        uint8_t* pData[4] = {nullptr};
-//                        int nPitch[4] = {0};
-//                        qcap2_av_frame_get_buffer1(pAVFrame, pData, nPitch);
-//                        if (pData[0] && pData[1]) {
-//                            char fn[128];
-//                            snprintf(fn, sizeof(fn), "ch%u_30_scaled_640x384_sysbuf.raw", channelId);
-//                            std::ofstream out(fn, std::ios::binary);
-//                            if (out.is_open()) {
-//                                // Write Y plane
-//                                for (int h = 0; h < 384; ++h) {
-//                                    out.write((char*)pData[0] + h * nPitch[0], 640);
-//                                }
-//                                // Write UV plane
-//                                for (int h = 0; h < 192; ++h) {
-//                                    out.write((char*)pData[1] + h * nPitch[1], 640);
-//                                }
-//                                out.close();
-//                                qDebug() << "Trace: onEventVdec - successfully wrote raw sysmem frame to" << fn;
-//                            } else {
-//                                qDebug() << "Trace: onEventVdec - failed to open" << fn << "for writing";
-//                            }
-//                        } else {
-//                            qDebug() << "Trace: onEventVdec - qcap2_av_frame_get_buffer1 returned null planes:" << pData[0] << pData[1];
-//                        }
-
-//                        if (pSurface) {
-//                            qcap2_rcbuffer_unmap_nvbuf(pSysBuffer);
-//                        }
-//                        qcap2_rcbuffer_unlock_data(pSysBuffer);
-//                    } else {
-//                        qDebug() << "Trace: onEventVdec - qcap2_rcbuffer_lock_data returned null";
-//                    }
-//                }
-                // Push to Video Sink
-                bool bSinkActive = false;
-                {
-                    QMutexLocker locker(&m_mutex);
-                    if (pVideoSink) bSinkActive = true;
-                }
-                if (bDisplayEnabled && bSinkActive && pLocalVideoSink) {
-//                    qDebug() << "Trace: onEventVdec - pushing to video sink...";
-                    qcap2_video_sink_push(pLocalVideoSink, pSysBuffer);
                 }
                 qcap2_rcbuffer_release(pSysBuffer);
             } else {
@@ -955,7 +757,7 @@ QRETURN ChannelContext::onEventVdec() {
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), m_bFullscreen(false),
       // AI init
-      overlayWidget(nullptr), m_bShowOverlay(true),
+      m_bShowOverlay(true), m_bHalfRefreshRate(false),
       handle(nullptr), flag(1),
       ai_running(false), pAiThread(nullptr),
       ready_count(0), active_camera_count(0)
@@ -1018,6 +820,10 @@ MainWindow::MainWindow(QWidget *parent)
     chkShowOverlay->setChecked(true);
     grpLayout->addWidget(chkShowOverlay);
 
+    chkHalfRefreshRate = new QCheckBox("Half Display Refresh Rate", grpConfig);
+    chkHalfRefreshRate->setChecked(false);
+    grpLayout->addWidget(chkHalfRefreshRate);
+
     controlLayout->addWidget(grpConfig);
 
     lblStatus = new QLabel("Status: Idle", controlPanel);
@@ -1043,6 +849,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(btnStop, &QPushButton::clicked, this, &MainWindow::onBtnStopClicked);
     connect(chkEnableDisplay, &QCheckBox::toggled, this, &MainWindow::onDisplayToggled);
     connect(chkShowOverlay, &QCheckBox::toggled, this, &MainWindow::onOverlayToggled);
+    connect(chkHalfRefreshRate, &QCheckBox::toggled, this, &MainWindow::onHalfRefreshRateToggled);
 
     videoContainer->installEventFilter(this);
 
@@ -1050,20 +857,10 @@ MainWindow::MainWindow(QWidget *parent)
 
     // ── Initialize QDEEP models ─────────────────────────────────────────
     init_models();
-
-    // ── Create Overlay Widget (top-level transparent window) ───────────
-    overlayWidget = new OverlayWidget(nullptr);
-    overlayWidget->setGeometry(this->geometry());
-    overlayWidget->show();
-    overlayWidget->raise();
 }
 
 MainWindow::~MainWindow()
 {
-    if (overlayWidget) {
-        delete overlayWidget;
-        overlayWidget = nullptr;
-    }
     uninit_models();
     stopAllChannels();
 }
@@ -1097,10 +894,18 @@ void MainWindow::onBtnStartClicked()
     int count = spinChannelCount->value();
 
     int cols = 2;
-    if (count <= 2) cols = count;
-    else if (count <= 4) cols = 2;
-    else if (count <= 9) cols = 3;
-    else cols = 4;
+    if (m_bFullscreen) {
+        if (count >= 17) {
+            cols = 8;
+        } else {
+            cols = 4;
+        }
+    } else {
+        if (count <= 2) cols = count;
+        else if (count <= 4) cols = 2;
+        else if (count <= 9) cols = 3;
+        else cols = 4;
+    }
 
     for (int i = 0; i < count; ++i) {
         QFrame *frame = new QFrame(videoContainer);
@@ -1108,6 +913,15 @@ void MainWindow::onBtnStartClicked()
         frame->setLineWidth(1);
         frame->setStyleSheet("background-color: black; border: 1px solid #333333;");
         frame->installEventFilter(this);
+
+        QVBoxLayout *layout = new QVBoxLayout(frame);
+        layout->setContentsMargins(0, 0, 0, 0);
+        QLabel *label = new QLabel(frame);
+        label->setAlignment(Qt::AlignCenter);
+        label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        label->setScaledContents(true);
+        layout->addWidget(label);
+
         videoFrames.append(frame);
 
         int row = i / cols;
@@ -1116,7 +930,7 @@ void MainWindow::onBtnStartClicked()
         frame->show();
 
         QString url = tableUrls->item(i, 1)->text().trimmed();
-        ChannelContext *ctx = new ChannelContext(i, url, frame->winId());
+        ChannelContext *ctx = new ChannelContext(i, url, label);
         ctx->setDisplayEnabled(m_bEnableDisplay);
         channels.append(ctx);
 
@@ -1184,9 +998,9 @@ void MainWindow::timerEvent(QTimerEvent *event)
             ChannelContext *ctx = channels[i];
             QMutexLocker locker(&ctx->m_mutex);
             statusText += QString("CH%1: %2 | %3 fps\n")
-                          .arg(i + 1)
-                          .arg(ctx->m_statusInfo.isEmpty() ? "Connecting..." : ctx->m_statusInfo)
-                          .arg(ctx->m_frameCount);
+                    .arg(i + 1)
+                    .arg(ctx->m_statusInfo.isEmpty() ? "Connecting..." : ctx->m_statusInfo)
+                    .arg(ctx->m_frameCount);
             ctx->m_frameCount = 0;
         }
         lblStatus->setText(statusText);
@@ -1216,7 +1030,11 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
         if (count > 0) {
             int cols = 2;
             if (m_bFullscreen) {
-                cols = 8;
+                if (count >= 17) {
+                    cols = 8;
+                } else {
+                    cols = 4;
+                }
             } else {
                 if (count <= 2) cols = count;
                 else if (count <= 4) cols = 2;
@@ -1247,43 +1065,13 @@ void MainWindow::onDisplayToggled(bool checked)
 void MainWindow::onOverlayToggled(bool checked)
 {
     m_bShowOverlay = checked;
-    if (overlayWidget) {
-        overlayWidget->update();
-    }
 }
 
-// ── Top-level OverlayWidget 事件追蹤 ──────────────────────────────────────
-void MainWindow::resizeEvent(QResizeEvent *event) {
-    QMainWindow::resizeEvent(event);
-    if (overlayWidget) {
-        overlayWidget->setGeometry(this->geometry());
-        overlayWidget->raise();
-    }
+void MainWindow::onHalfRefreshRateToggled(bool checked)
+{
+    m_bHalfRefreshRate = checked;
 }
 
-void MainWindow::moveEvent(QMoveEvent *event) {
-    QMainWindow::moveEvent(event);
-    if (overlayWidget) {
-        overlayWidget->setGeometry(this->geometry());
-        overlayWidget->raise();
-    }
-}
-
-void MainWindow::hideEvent(QHideEvent *event) {
-    QMainWindow::hideEvent(event);
-    if (overlayWidget) {
-        overlayWidget->hide();
-    }
-}
-
-void MainWindow::showEvent(QShowEvent *event) {
-    QMainWindow::showEvent(event);
-    if (overlayWidget) {
-        overlayWidget->setGeometry(this->geometry());
-        overlayWidget->show();
-        overlayWidget->raise();
-    }
-}
 
 // ── QDEEP / YOLO AI Functions ──────────────────────────────────────────────
 void MainWindow::init_models()
@@ -1297,11 +1085,18 @@ void MainWindow::init_models()
         buffer_len_vec[i] = MAX_BUFFER_SIZE;
     }
 
-    QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
-        (char*)"/home/nvidia/Music/thor_receive_rtsp_ai/model/skeleton_ex/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
-        &handle, flag, MAX_BATCH);
+        QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
+            QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+            QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
+            (char*)"/home/nvidia/Music/thor_receive_rtsp_ai/model/skeleton_ex/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
+            &handle, flag, MAX_BATCH);
+
+    //arya
+//    QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
+//                QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+//                QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
+//                (char*)"/home/nvidia/Downloads/arya/sdvoe_bacth/demo/model/skeleton_ex/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
+//                &handle, flag, MAX_BATCH);
 
     qDebug() << "[AI Log] QDEEP_CREATE_BATCH_OBJECT_DETECT res:" << QString("0x%1").arg(res, 8, 16, QChar('0')) << "handle:" << handle;
 
@@ -1500,38 +1295,110 @@ void MainWindow::ai_inference_thread()
             last_log_time = now;
         }
 
-        // 處理結果
-        {
-            std::lock_guard<std::mutex> draw_lock(draw_mtx);
-            for (int i = 0; i < MAX_BATCH; ++i) {
-                draw_persons[i].clear();
+        // 處理結果並使用 OpenCV 渲染顯示
+        for (int i = 0; i < MAX_BATCH; ++i) {
+            if (width_vec[i] > 0 && buffer_vec[i] != nullptr) {
+                ChannelContext* ctx = nullptr;
+                for (auto* c : channels) {
+                    if (c->channelId == i) {
+                        ctx = c;
+                        break;
+                    }
+                }
 
-                if (width_vec[i] > 0 && box_size_vec[i] > 0) {
-                    for (ULONG j = 0; j < box_size_vec[i]; ++j) {
-                        auto& deep_box = box_list_vec[i][j];
+                if (ctx && ctx->m_bDisplayEnabled && ctx->m_pLabel) {
+                    // Convert contiguous NV12 to BGR Mat
+                    cv::Mat nv12_mat(384 * 3 / 2, 640, CV_8UC1, buffer_vec[i]);
+                    cv::Mat bgr_mat;
+                    cv::cvtColor(nv12_mat, bgr_mat, cv::COLOR_YUV2BGR_NV12);
 
-                        DrawPerson dp;
-                        dp.classId = deep_box.nClassID;
-                        dp.probability = deep_box.fProbability;
+                    // Draw AI results if enabled
+                    if (m_bShowOverlay) {
+                        // Draw channel header text
+                        std::string headerText = "CH " + std::to_string(i + 1) + " | People: " + std::to_string(box_size_vec[i]);
+                        cv::putText(bgr_mat, headerText, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
 
-                        for (int k = 0; k < 17; ++k) {
-                            dp.keypoints[k].x = deep_box.sKeypoints[k].nX;
-                            dp.keypoints[k].y = deep_box.sKeypoints[k].nY;
-                            dp.keypoints[k].probability = deep_box.sKeypoints[k].fProbability;
+                        // Draw bounding boxes and skeleton lines
+                        for (ULONG j = 0; j < box_size_vec[i]; ++j) {
+                            auto& deep_box = box_list_vec[i][j];
+
+                            // Collect keypoints
+                            const float kpt_thresh = 0.3f;
+                            cv::Point kpts[17];
+                            bool kpt_valid[17] = {false};
+                            for (int k = 0; k < 17; ++k) {
+                                if (deep_box.sKeypoints[k].fProbability >= kpt_thresh) {
+                                    kpts[k] = cv::Point(deep_box.sKeypoints[k].nX, deep_box.sKeypoints[k].nY);
+                                    kpt_valid[k] = true;
+                                }
+                            }
+
+                            // Draw skeleton connections
+                            for (const auto& conn : connections) {
+                                int p1 = conn.first;
+                                int p2 = conn.second;
+                                if (kpt_valid[p1] && kpt_valid[p2]) {
+                                    cv::Scalar connColor;
+                                    if (p1 == 0 || p2 == 0 || p1 >= 13 || p2 >= 13) {
+                                        connColor = cv::Scalar(0, 255, 255); // Yellow (Face)
+                                    } else if (p1 == 4 || p1 == 5 || p1 == 6 || p1 == 10 || p1 == 11 || p1 == 12 ||
+                                               p2 == 4 || p2 == 5 || p2 == 6 || p2 == 10 || p2 == 11 || p2 == 12) {
+                                        connColor = cv::Scalar(255, 255, 0); // Cyan (Left side)
+                                    } else {
+                                        connColor = cv::Scalar(147, 20, 255); // Neon pink (Right side)
+                                    }
+                                    cv::line(bgr_mat, kpts[p1], kpts[p2], connColor, 2);
+                                }
+                            }
+
+                            // Draw joints
+                            for (int k = 0; k < 17; ++k) {
+                                if (kpt_valid[k]) {
+                                    cv::Scalar jointColor;
+                                    if (k == 0 || k >= 13) {
+                                        jointColor = cv::Scalar(0, 255, 255); // Yellow (Face)
+                                    } else if (k == 4 || k == 5 || k == 6 || k == 10 || k == 11 || k == 12) {
+                                        jointColor = cv::Scalar(255, 255, 0); // Cyan (Left side)
+                                    } else {
+                                        jointColor = cv::Scalar(128, 0, 255); // Pink/Red (Right side)
+                                    }
+                                    cv::circle(bgr_mat, kpts[k], 4, jointColor, -1);
+                                    cv::circle(bgr_mat, kpts[k], 4, cv::Scalar(255, 255, 255), 1);
+                                }
+                            }
                         }
+                    }
 
-                        draw_persons[i].push_back(dp);
+                    // Check display rate halving
+                    bool skip_this_frame = false;
+                    if (m_bHalfRefreshRate) {
+                        int f_cnt = ctx->m_displayFrameCount.fetch_add(1);
+                        if (f_cnt % 2 != 0) {
+                            skip_this_frame = true;
+                        }
+                    }
+
+                    if (!skip_this_frame) {
+                        // Check backpressure: skip frame if the GUI thread is busy rendering the previous one
+                        if (ctx->m_pPendingUpdate && !ctx->m_pPendingUpdate->exchange(true)) {
+                            // Convert cv::Mat to QImage
+                            QImage qimg = cvMatToQImage(bgr_mat);
+                            QPointer<QLabel> safeLabel = ctx->m_pLabel;
+                            std::shared_ptr<std::atomic<bool>> pending = ctx->m_pPendingUpdate;
+
+                            // Update GUI QLabel asynchronously
+                            QMetaObject::invokeMethod(ctx->m_pLabel, [safeLabel, qimg, pending]() {
+                                if (safeLabel) {
+                                    safeLabel->setPixmap(QPixmap::fromImage(qimg));
+                                }
+                                if (pending) {
+                                    pending->store(false);
+                                }
+                            }, Qt::QueuedConnection);
+                        }
                     }
                 }
             }
         }
-
-        // 觸發 overlay 更新（UI thread）
-        QMetaObject::invokeMethod(this, [this]() {
-            if (overlayWidget) {
-                overlayWidget->raise();
-                overlayWidget->update();
-            }
-        }, Qt::QueuedConnection);
     }
 }

@@ -12,6 +12,8 @@
 #include <QVector>
 #include <QMutex>
 #include <QCheckBox>
+#include <QPointer>
+
 
 // Include QCAP headers
 #include "qcap.h"
@@ -23,10 +25,12 @@
 #include <QElapsedTimer>
 
 #include <vector>
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <condition_variable>
 #include <chrono>
+#include <memory>
 
 namespace QDEEP_API {
     #include "QDEEP.H"
@@ -34,7 +38,7 @@ namespace QDEEP_API {
 
 // ── AI Constants ────────────────────────────────────────────────────────────
 #define BOX_SIZE 100
-#define MAX_BATCH 16
+#define MAX_BATCH 8
 #define MAX_BUFFER_SIZE (1920 * 1080 * 3 / 2)
 #define TARGET_FPS 30.0
 #define FRAME_INTERVAL (1.0 / TARGET_FPS)
@@ -52,18 +56,15 @@ struct DrawPerson {
     float probability;
 };
 
-class OverlayWidget;
-
 struct ChannelContext {
     int channelId;
     QString url;
-    uintptr_t m_winId;
+    QLabel* m_pLabel;
 
     PVOID pClient;
     qcap2_video_decoder_t* pVdec;
     qcap2_event_handlers_t* pEventHandlers;
     qcap2_event_t* pEvent_vdec;
-    qcap2_video_sink_t* pVideoSink;
     qcap2_video_scaler_t* pScaler2;
     qcap2_video_scaler_t* pScaler3;
     qcap2_rcbuffer_t* m_pScalerBuffers3[8];
@@ -83,6 +84,8 @@ struct ChannelContext {
 
     // Display toggle
     bool m_bDisplayEnabled;
+    std::shared_ptr<std::atomic<bool>> m_pPendingUpdate;
+    std::atomic<int> m_displayFrameCount;
 
     // Profiling
     QElapsedTimer m_pushTimer;
@@ -99,15 +102,17 @@ struct ChannelContext {
     int m_nAIWidth;             // Width for AI processing
     int m_nAIHeight;            // Height for AI processing
 
-    ChannelContext(int id, const QString& streamUrl, uintptr_t winId);
+    ChannelContext(int id, const QString& streamUrl, QLabel* pLabel);
     ~ChannelContext();
 
     bool start();
     void stop();
+    void cleanupPipeline();
     void setDisplayEnabled(bool enabled);
 
     QRETURN onConnected(PVOID pClient, UINT iSessionNum, ULONG nVideoEncoderFormat, ULONG nVideoWidth, ULONG nVideoHeight, BOOL bVideoIsInterleaved, double dVideoFrameRate);
     QRETURN onVideoCallback(double dSampleTime, BYTE * pStreamBuffer, ULONG nStreamBufferLen, BOOL bIsKeyFrame);
+    QRETURN onFail(UINT iSessionNum, QRESULT nErrorStatus, DWORD nErrorCode);
     QRETURN onEventVdec();
 };
 
@@ -123,10 +128,7 @@ protected:
     void timerEvent(QTimerEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
-    void resizeEvent(QResizeEvent *event) override;
-    void moveEvent(QMoveEvent *event) override;
-    void hideEvent(QHideEvent *event) override;
-    void showEvent(QShowEvent *event) override;
+
 
 private slots:
     void onBtnStartClicked();
@@ -134,15 +136,16 @@ private slots:
     void onChannelCountChanged(int count);
     void onDisplayToggled(bool checked);
     void onOverlayToggled(bool checked);
+    void onHalfRefreshRateToggled(bool checked);
 
 public:
-    OverlayWidget *overlayWidget;
     bool m_bShowOverlay;
     QVector<QFrame*> videoFrames;
     QVector<ChannelContext*> channels;
     int m_timerId;
     bool m_bFullscreen;
     bool m_bEnableDisplay;
+    bool m_bHalfRefreshRate;
     static const int MAX_CHANNELS = 16;
 
 public:
@@ -189,6 +192,7 @@ private:
     QPushButton *btnStop;
     QCheckBox *chkEnableDisplay;
     QCheckBox *chkShowOverlay;
+    QCheckBox *chkHalfRefreshRate;
     QLabel *lblStatus;
 };
 
