@@ -4,9 +4,8 @@ export QCAP_LOG_LEVEL=0
 
 #for fd over1024
 #export LD_PRELOAD=/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/select2poll/libselect2poll.so
-ulimit -n 4096
-export LD_PRELOAD=/home/nvidia/Music/thor_receive_rtsp_ai/select2poll/libselect2poll.so
-./QtQcapMultiClientDemo_17kps
+ulimit -n 8192
+#export LD_PRELOAD=/home/nvidia/Music/thor_receive_rtsp_ai/select2poll/libselect2poll.so
 
 
 #export QCAP_VO_USE_GSTREAMER=1

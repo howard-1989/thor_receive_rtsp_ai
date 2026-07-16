@@ -1,3 +1,15 @@
+/**
+ * select2poll.c — LD_PRELOAD wrapper
+ *
+ * Overrides select() → ppoll() to bypass FD_SETSIZE=1024 limit.
+ * Also overrides __fdelt_chk/__fdelt_warn so FD_SET on fd>=1024 doesn't abort.
+ *
+ * Build:
+ *   gcc -shared -fPIC -o libselect2poll.so select2poll.c -ldl
+ *
+ * Usage:
+ *   LD_PRELOAD=./libselect2poll.so ./QtQcapMultiClientDemo_17kps
+ */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <sys/select.h>
@@ -7,13 +19,10 @@
 #include <stdio.h>
 #include <errno.h>
 #include <stdint.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <stdarg.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 
 /* ── Bypass glibc fortified FD_SET/FD_CLR check ────────────────────────── */
+/* Suppress "bit out of range" abort. The real select() is also replaced,
+   so large FDs will be handled via ppoll() which has no 1024 limit. */
 long __fdelt_chk(long d)
 {
     return d / (8 * (long)sizeof(long));
@@ -71,10 +80,14 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
                       dlsym(RTLD_NEXT, "select");
     }
 
+    /* If within FD_SETSIZE range, just use real select() */
     if (nfds <= FD_SETSIZE && real_select) {
         return real_select(nfds, readfds, writefds, exceptfds, timeout);
     }
 
+    /* Convert to ppoll() */
+
+    /* Build pollfd array from readfds + writefds */
     struct pollfd *all_pfds = NULL;
     int total_count = 0;
 
@@ -94,6 +107,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
         total_count = r_cnt;
     }
 
+    /* Also add exceptfds (rarely used) */
     struct pollfd *e = fdset_to_pollfds(nfds, exceptfds, POLLPRI, &total_count);
     if (e) {
         int old_cnt = total_count;
@@ -104,6 +118,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
         free(e);
     }
 
+    /* Convert timeout */
     struct timespec ts, *pts = NULL;
     if (timeout) {
         ts.tv_sec = timeout->tv_sec;
@@ -130,6 +145,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
             }
         }
     } else if (ret == 0) {
+        /* timeout — all sets empty */
         if (readfds) FD_ZERO(readfds);
         if (writefds) FD_ZERO(writefds);
         if (exceptfds) FD_ZERO(exceptfds);
@@ -137,134 +153,4 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 
     free(all_pfds);
     return ret;
-}
-
-/* ── File Descriptor Redirection to keep socket FDs < 1000 ──────────────── */
-static int (*real_open)(const char *, int, ...) = NULL;
-static int (*real_open64)(const char *, int, ...) = NULL;
-static int (*real_openat)(int, const char *, int, ...) = NULL;
-static int (*real_openat64)(int, const char *, int, ...) = NULL;
-static int (*real_creat)(const char *, mode_t) = NULL;
-static int (*real_creat64)(const char *, mode_t) = NULL;
-static int (*real_dup)(int) = NULL;
-static int (*real_dup2)(int, int) = NULL;
-static int (*real_dup3)(int, int, int) = NULL;
-static int (*real_fcntl)(int, int, ...) = NULL;
-
-__attribute__((constructor)) static void init_all() {
-    real_select = dlsym(RTLD_NEXT, "select");
-    real_open = dlsym(RTLD_NEXT, "open");
-    real_open64 = dlsym(RTLD_NEXT, "open64");
-    real_openat = dlsym(RTLD_NEXT, "openat");
-    real_openat64 = dlsym(RTLD_NEXT, "openat64");
-    real_creat = dlsym(RTLD_NEXT, "creat");
-    real_creat64 = dlsym(RTLD_NEXT, "creat64");
-    real_dup = dlsym(RTLD_NEXT, "dup");
-    real_dup2 = dlsym(RTLD_NEXT, "dup2");
-    real_dup3 = dlsym(RTLD_NEXT, "dup3");
-    real_fcntl = dlsym(RTLD_NEXT, "fcntl");
-}
-
-static int redirect_fd(int fd) {
-    if (fd >= 0 && fd < 1000) {
-        int new_fd = fcntl(fd, F_DUPFD, 1000);
-        if (new_fd >= 0) {
-            close(fd);
-            return new_fd;
-        }
-    }
-    return fd;
-}
-
-int open(const char *pathname, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode = va_arg(args, mode_t);
-        va_end(args);
-    }
-    int fd = real_open ? real_open(pathname, flags, mode) : -1;
-    return redirect_fd(fd);
-}
-
-int open64(const char *pathname, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode = va_arg(args, mode_t);
-        va_end(args);
-    }
-    int fd = real_open64 ? real_open64(pathname, flags, mode) : (real_open ? real_open(pathname, flags, mode) : -1);
-    return redirect_fd(fd);
-}
-
-int openat(int dirfd, const char *pathname, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode = va_arg(args, mode_t);
-        va_end(args);
-    }
-    int fd = real_openat ? real_openat(dirfd, pathname, flags, mode) : -1;
-    return redirect_fd(fd);
-}
-
-int openat64(int dirfd, const char *pathname, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode = va_arg(args, mode_t);
-        va_end(args);
-    }
-    int fd = real_openat64 ? real_openat64(dirfd, pathname, flags, mode) : (real_openat ? real_openat(dirfd, pathname, flags, mode) : -1);
-    return redirect_fd(fd);
-}
-
-int creat(const char *pathname, mode_t mode) {
-    int fd = real_creat ? real_creat(pathname, mode) : -1;
-    return redirect_fd(fd);
-}
-
-int creat64(const char *pathname, mode_t mode) {
-    int fd = real_creat64 ? real_creat64(pathname, mode) : (real_creat ? real_creat(pathname, mode) : -1);
-    return redirect_fd(fd);
-}
-
-int dup(int oldfd) {
-    int fd = real_dup ? real_dup(oldfd) : -1;
-    if (oldfd >= 1000) {
-        return redirect_fd(fd);
-    }
-    return fd;
-}
-
-int dup2(int oldfd, int newfd) {
-    return real_dup2 ? real_dup2(oldfd, newfd) : -1;
-}
-
-int dup3(int oldfd, int newfd, int flags) {
-    return real_dup3 ? real_dup3(oldfd, newfd, flags) : -1;
-}
-
-int fcntl(int fd, int cmd, ...) {
-    va_list args;
-    va_start(args, cmd);
-    void *arg = va_arg(args, void *);
-    va_end(args);
-
-    if (!real_fcntl) return -1;
-
-    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
-        long target = (long)arg;
-        if (fd >= 1000 && target < 1000) {
-            target = 1000;
-        }
-        return real_fcntl(fd, cmd, target);
-    }
-
-    return real_fcntl(fd, cmd, arg);
 }
