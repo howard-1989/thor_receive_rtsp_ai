@@ -12,6 +12,7 @@
 #include <QVector>
 #include <QMutex>
 #include <QCheckBox>
+#include <QPointer>
 
 // Include QCAP headers
 #include "qcap.h"
@@ -23,10 +24,12 @@
 #include <QElapsedTimer>
 
 #include <vector>
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <condition_variable>
 #include <chrono>
+#include <memory>
 
 namespace QDEEP_API {
     #include "QDEEP.H"
@@ -39,26 +42,20 @@ namespace QDEEP_API {
 #define TARGET_FPS 30.0
 #define FRAME_INTERVAL (1.0 / TARGET_FPS)
 
-// ── Detection Box Structure ─────────────────────────────────────────────────
-struct DrawBox {
-    int original_x, original_y, original_w, original_h;
-    int classId;
-    float probability;
-};
-
-class OverlayWidget;
-
 struct ChannelContext {
     int channelId;
     QString url;
-    uintptr_t m_winId;
+    QLabel* m_pLabel;
 
     PVOID pClient;
     qcap2_video_decoder_t* pVdec;
     qcap2_event_handlers_t* pEventHandlers;
     qcap2_event_t* pEvent_vdec;
-    qcap2_video_sink_t* pVideoSink;
-    qcap2_video_scaler_t* pScaler;
+    qcap2_video_scaler_t* pScaler2;
+    qcap2_video_scaler_t* pScaler3;
+    qcap2_rcbuffer_t* m_pScalerBuffers3[8];
+    qcap2_rcbuffer_t* m_pCurrentAIRCBuffer;
+    qcap2_rcbuffer_queue_t* m_pAIQueue;      // AI frame queue for pipeline optimization
 
     // Connected format properties
     ULONG m_nVideoWidth;
@@ -73,6 +70,8 @@ struct ChannelContext {
 
     // Display toggle
     bool m_bDisplayEnabled;
+    std::shared_ptr<std::atomic<bool>> m_pPendingUpdate;
+    std::atomic<int> m_displayFrameCount;
 
     // Profiling
     QElapsedTimer m_pushTimer;
@@ -81,23 +80,25 @@ struct ChannelContext {
     int m_decFrameCount;
 
     // ── AI fields ────────────────────────────────────────────────────────
-    bool m_bSendBuffer;
-    double m_lastProcessTime;
-    bool m_bFrameReady;
-    BYTE* m_pAIBuffer;
-    ULONG m_nAIBufferLen;
-    int m_nAIWidth;
-    int m_nAIHeight;
+    bool m_bSendBuffer;         // Whether to send frames to AI
+    double m_lastProcessTime;   // Last AI frame submission time
+    bool m_bFrameReady;         // Whether a frame is ready for AI
+    BYTE* m_pAIBuffer;          // NV12 data buffer for AI
+    ULONG m_nAIBufferLen;       // Length of AI buffer
+    int m_nAIWidth;             // Width for AI processing
+    int m_nAIHeight;            // Height for AI processing
 
-    ChannelContext(int id, const QString& streamUrl, uintptr_t winId);
+    ChannelContext(int id, const QString& streamUrl, QLabel* pLabel);
     ~ChannelContext();
 
     bool start();
     void stop();
+    void cleanupPipeline();
     void setDisplayEnabled(bool enabled);
 
     QRETURN onConnected(PVOID pClient, UINT iSessionNum, ULONG nVideoEncoderFormat, ULONG nVideoWidth, ULONG nVideoHeight, BOOL bVideoIsInterleaved, double dVideoFrameRate);
     QRETURN onVideoCallback(double dSampleTime, BYTE * pStreamBuffer, ULONG nStreamBufferLen, BOOL bIsKeyFrame);
+    QRETURN onFail(UINT iSessionNum, QRESULT nErrorStatus, DWORD nErrorCode);
     QRETURN onEventVdec();
 };
 
@@ -113,10 +114,6 @@ protected:
     void timerEvent(QTimerEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
-    void resizeEvent(QResizeEvent *event) override;
-    void moveEvent(QMoveEvent *event) override;
-    void hideEvent(QHideEvent *event) override;
-    void showEvent(QShowEvent *event) override;
 
 private slots:
     void onBtnStartClicked();
@@ -124,15 +121,16 @@ private slots:
     void onChannelCountChanged(int count);
     void onDisplayToggled(bool checked);
     void onOverlayToggled(bool checked);
+    void onHalfRefreshRateToggled(bool checked);
 
 public:
-    OverlayWidget *overlayWidget;
     bool m_bShowOverlay;
     QVector<QFrame*> videoFrames;
     QVector<ChannelContext*> channels;
     int m_timerId;
     bool m_bFullscreen;
     bool m_bEnableDisplay;
+    bool m_bHalfRefreshRate;
     static const int MAX_CHANNELS = 64;
 
 public:
@@ -152,9 +150,6 @@ public:
     std::thread* pAiThread;
     int ready_count;
     int active_camera_count;
-
-    std::vector<DrawBox> draw_boxes[MAX_BATCH];
-    std::mutex draw_mtx;
 
 private:
     void clearGrid();
@@ -179,6 +174,7 @@ private:
     QPushButton *btnStop;
     QCheckBox *chkEnableDisplay;
     QCheckBox *chkShowOverlay;
+    QCheckBox *chkHalfRefreshRate;
     QLabel *lblStatus;
 };
 
