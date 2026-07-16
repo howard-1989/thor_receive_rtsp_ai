@@ -1,46 +1,22 @@
 #include "mainwindow.h"
-#include <fstream>
-#include "qcap.linux.h"
+#include <QDebug>
 #include <QHBoxLayout>
-#include <QElapsedTimer>
 #include <QVBoxLayout>
 #include <QGroupBox>
 #include <QHeaderView>
-#include <QApplication>
-#include <QScreen>
-#include <QDebug>
-#include <QCloseEvent>
-#include <QResizeEvent>
-#include <QMoveEvent>
-#include <QHideEvent>
-#include <QShowEvent>
-#include <QPainter>
-#include <QDateTime>
-#include <cmath>
+#include <QEvent>
+#include <QMouseEvent>
+#include <QPointer>
+#include <QMetaObject>
+#include <QPixmap>
+
+#include <opencv2/opencv.hpp>
 
 MainWindow *g_pMainwindow = nullptr;
-//arya
-uint32_t count = 0;
-double elapsed = 0.0;
 
 extern "C" {
 QDEEP_EXT_API QRESULT QDEEP_EXPORT QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(PVOID pDetector, ULONG* pCheckNum);
 }
-
-#include <opencv2/opencv.hpp>
-
-// COCO 17 Keypoints connections
-const std::vector<std::pair<int, int>> connections = {
-    {0, 14}, {0, 13},       // Nose to Eyes
-    {14, 16}, {13, 15},     // Eyes to Ears
-    {4, 1},                 // Shoulder line
-    {4, 5}, {5, 6},         // Left arm
-    {1, 2}, {2, 3},         // Right arm
-    {10, 7},                // Hip line
-    {4, 10}, {1, 7},        // Torso sides
-    {10, 11}, {11, 12},     // Left leg
-    {7, 8}, {8, 9}          // Right leg
-};
 
 QImage cvMatToQImage(const cv::Mat& mat) {
     if (mat.type() == CV_8UC3) {
@@ -103,8 +79,7 @@ ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
     : channelId(id), url(streamUrl), m_pLabel(pLabel),
       pClient(nullptr), pVdec(nullptr), pEventHandlers(nullptr),
       pEvent_vdec(nullptr),
-      pScaler2(nullptr),
-      m_pCurrentAIRCBuffer(nullptr),
+      pScaler2(nullptr), m_pCurrentAIRCBuffer(nullptr),
       m_pAIQueue(nullptr),
       m_nVideoWidth(0), m_nVideoHeight(0), m_dVideoFrameRate(0.0), m_nVideoEncoderFormat(0),
       m_frameCount(0), m_bDisplayEnabled(true),
@@ -116,7 +91,6 @@ ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
     m_pPendingUpdate = std::make_shared<std::atomic<bool>>(false);
     m_displayFrameCount = 0;
 }
-
 
 ChannelContext::~ChannelContext() {
     if (m_pAIBuffer) {
@@ -387,7 +361,7 @@ QRETURN ChannelContext::onConnected(
     qcap2_event_get_native_handle(pEvent_vdec, &nHandle_vdec);
     qcap2_event_handlers_add_handler(pEventHandlers, nHandle_vdec, on_event_vdec_callback, this);
 
-    // Initialize nvv4l2 Hardware Decoder
+    // Initialize software Decoder
     pVdec = qcap2_video_decoder_new();
     if (!pVdec) {
         qCritical() << "CH" << channelId << "Failed to create video decoder.";
@@ -475,7 +449,6 @@ QRETURN ChannelContext::onConnected(
     }
 
     qDebug() << "Trace: Setting video scaler 2 properties (Scaler 2)...";
-    // Scaler 1: DEFAULT scaler 1920x1080 sysbuf -> 640x384 sysbuf
     qcap2_video_scaler_set_backend_type(pScaler2, QCAP2_VIDEO_SCALER_BACKEND_TYPE_DEFAULT);
     qcap2_video_format_t* pScalerFormat2 = qcap2_video_format_new();
     if (pScalerFormat2) {
@@ -513,7 +486,6 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
     Q_UNUSED(dSampleTime);
     Q_UNUSED(bIsKeyFrame);
 
-    //    qDebug() << "Trace: onVideoCallback entry";
     qcap2_video_decoder_t* pLocalVdec = nullptr;
 
     {
@@ -526,17 +498,14 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
 
     qcap2_rcbuffer_t* pRCBuffer = qcap2_rcbuffer_cast(pStreamBuffer, nStreamBufferLen);
     if (!pRCBuffer) {
-        qDebug() << "Trace: onVideoCallback - pRCBuffer is null";
         return QCAP_RT_OK;
     }
 
-    //    qDebug() << "Trace: onVideoCallback - pushing H.264 packet to decoder...";
-    // Push H.264 packet directly to the hardware decoder
+    // Push packet directly to the hardware decoder
     QRESULT qres = qcap2_video_decoder_push(pLocalVdec, pRCBuffer);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qCritical() << "qcap2_video_decoder_push failed for CH" << channelId << "qres =" << qres;
     }
-    //    qDebug() << "Trace: onVideoCallback finished pushing";
 
     if (!m_pushTimer.isValid()) {
         m_pushTimer.start();
@@ -667,60 +636,43 @@ QRETURN ChannelContext::onEventVdec() {
 
                             // Draw AI results if enabled
                             if (g_pMainwindow && g_pMainwindow->m_bShowOverlay) {
-                                std::string headerText = "CH " + std::to_string(channelId + 1);
-                                cv::putText(bgr_mat, headerText, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
-
-                                std::vector<DrawPerson> local_persons;
+                                std::vector<DrawBox> local_boxes;
                                 {
                                     std::lock_guard<std::mutex> draw_lock(g_pMainwindow->draw_mtx);
-                                    local_persons = g_pMainwindow->draw_persons[channelId];
+                                    local_boxes = g_pMainwindow->draw_boxes[channelId];
                                 }
 
-                                for (const auto& person : local_persons) {
-                                    const float kpt_thresh = 0.3f;
-                                    cv::Point kpts[17];
-                                    bool kpt_valid[17] = {false};
-                                    for (int k = 0; k < 17; ++k) {
-                                        if (person.keypoints[k].probability >= kpt_thresh) {
-                                            kpts[k] = cv::Point(person.keypoints[k].x, person.keypoints[k].y);
-                                            kpt_valid[k] = true;
-                                        }
-                                    }
+                                std::string headerText = "CH " + std::to_string(channelId + 1) + " | People: " + std::to_string(local_boxes.size());
+                                cv::putText(bgr_mat, headerText, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
 
-                                    // Draw skeleton connections
-                                    for (const auto& conn : connections) {
-                                        int p1 = conn.first;
-                                        int p2 = conn.second;
-                                        if (kpt_valid[p1] && kpt_valid[p2]) {
-                                            cv::Scalar connColor;
-                                            if (p1 == 0 || p2 == 0 || p1 >= 13 || p2 >= 13) {
-                                                connColor = cv::Scalar(0, 255, 255); // Yellow (Face)
-                                            } else if (p1 == 4 || p1 == 5 || p1 == 6 || p1 == 10 || p1 == 11 || p1 == 12 ||
-                                                       p2 == 4 || p2 == 5 || p2 == 6 || p2 == 10 || p2 == 11 || p2 == 12) {
-                                                connColor = cv::Scalar(255, 255, 0); // Cyan (Left side)
-                                            } else {
-                                                connColor = cv::Scalar(147, 20, 255); // Neon pink (Right side)
-                                            }
-                                            cv::line(bgr_mat, kpts[p1], kpts[p2], connColor, 2);
-                                        }
-                                    }
+                                for (const auto& box : local_boxes) {
+                                    cv::Rect rect(box.x, box.y, box.width, box.height);
+                                    
+                                    // Draw bounding box outline
+                                    cv::rectangle(bgr_mat, rect, cv::Scalar(0, 255, 0), 2);
 
-                                    // Draw joints
-                                    for (int k = 0; k < 17; ++k) {
-                                        if (kpt_valid[k]) {
-                                            cv::Scalar jointColor;
-                                            if (k == 0 || k >= 13) {
-                                                jointColor = cv::Scalar(0, 255, 255); // Yellow (Face)
-                                            } else if (k == 4 || k == 5 || k == 6 || k == 10 || k == 11 || k == 12) {
-                                                jointColor = cv::Scalar(255, 255, 0); // Cyan (Left side)
-                                            } else {
-                                                jointColor = cv::Scalar(128, 0, 255); // Pink/Red (Right side)
-                                            }
-                                            cv::circle(bgr_mat, kpts[k], 4, jointColor, -1);
-                                            cv::circle(bgr_mat, kpts[k], 4, cv::Scalar(255, 255, 255), 1);
-                                        }
+                                    // Draw text label with class/prob
+                                    std::string labelText = "Person: " + std::to_string((int)(box.probability * 100)) + "%";
+                                    int baseLine = 0;
+                                    cv::Size labelSize = cv::getTextSize(labelText, cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseLine);
+                                    
+                                    int textY = box.y - 5;
+                                    if (textY < labelSize.height) {
+                                        textY = box.y + labelSize.height + 5;
                                     }
+                                    
+                                    // Draw label background
+                                    cv::rectangle(bgr_mat, cv::Point(box.x, textY - labelSize.height - 2), 
+                                                  cv::Point(box.x + labelSize.width, textY + baseLine), 
+                                                  cv::Scalar(0, 255, 0), cv::FILLED);
+                                                  
+                                    // Draw label text in black
+                                    cv::putText(bgr_mat, labelText, cv::Point(box.x, textY), 
+                                                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
                                 }
+                            } else {
+                                std::string headerText = "CH " + std::to_string(channelId + 1);
+                                cv::putText(bgr_mat, headerText, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
                             }
 
                             // Convert cv::Mat to QImage
@@ -743,7 +695,6 @@ QRETURN ChannelContext::onEventVdec() {
                 }
             }
         }
-
         qcap2_rcbuffer_release(pScaledBuffer);
     }
 
@@ -760,15 +711,14 @@ QRETURN ChannelContext::onEventVdec() {
 
 // ── MainWindow Implementation ───────────────────────────────────────────────
 MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent),
-      m_bShowOverlay(true),
-      m_bFullscreen(false),
-      m_bHalfRefreshRate(false),
+    : QMainWindow(parent), m_bFullscreen(false),
+      // AI init
+      m_bShowOverlay(true), m_bHalfRefreshRate(false),
       handle(nullptr), flag(1),
       ai_running(false), pAiThread(nullptr),
       ready_count(0), active_camera_count(0)
 {
-    setWindowTitle("QCAP Multichannel RTSP + QDEEP 17KPS Skeleton");
+    setWindowTitle("QCAP Multichannel RTSP + QDEEP People Detection");
     resize(1280, 720);
 
     g_pMainwindow = this;
@@ -822,7 +772,7 @@ MainWindow::MainWindow(QWidget *parent)
     chkEnableDisplay->setChecked(true);
     grpLayout->addWidget(chkEnableDisplay);
 
-    chkShowOverlay = new QCheckBox("Show AI Skeleton Overlay", grpConfig);
+    chkShowOverlay = new QCheckBox("Show AI Detection Boxes", grpConfig);
     chkShowOverlay->setChecked(true);
     grpLayout->addWidget(chkShowOverlay);
 
@@ -886,8 +836,7 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            QString defaultUrl = QString("rtsp://root:root@192.168.191.6:1554/session0.mpg");
-            tableUrls->setItem(i, 1, new QTableWidgetItem(defaultUrl));
+            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.191.6:1554/session0.mpg"));
         }
     }
 }
@@ -898,7 +847,6 @@ void MainWindow::onBtnStartClicked()
     clearGrid();
 
     int count = spinChannelCount->value();
-
     int cols = 2;
     if (m_bFullscreen) {
         if (count >= 17) {
@@ -969,17 +917,9 @@ void MainWindow::onBtnStopClicked()
 
 void MainWindow::stopAllChannels()
 {
-    std::vector<std::thread> stop_threads;
     for (ChannelContext *ctx : channels) {
         ctx->m_bSendBuffer = false;
-        stop_threads.push_back(std::thread([ctx]() {
-            delete ctx;
-        }));
-    }
-    for (auto& t : stop_threads) {
-        if (t.joinable()) {
-            t.join();
-        }
+        delete ctx;
     }
     channels.clear();
 }
@@ -1032,6 +972,7 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
             showNormal();
         }
 
+        // Adjust Grid layout
         int count = videoFrames.size();
         if (count > 0) {
             int cols = 2;
@@ -1063,8 +1004,8 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 void MainWindow::onDisplayToggled(bool checked)
 {
     m_bEnableDisplay = checked;
-    for (ChannelContext *ctx : channels) {
-        ctx->setDisplayEnabled(checked);
+    for (auto* c : channels) {
+        c->setDisplayEnabled(checked);
     }
 }
 
@@ -1078,7 +1019,6 @@ void MainWindow::onHalfRefreshRateToggled(bool checked)
     m_bHalfRefreshRate = checked;
 }
 
-
 // ── QDEEP / YOLO AI Functions ──────────────────────────────────────────────
 void MainWindow::init_models()
 {
@@ -1091,18 +1031,12 @@ void MainWindow::init_models()
         buffer_len_vec[i] = MAX_BUFFER_SIZE;
     }
 
-    //    QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-    //        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-    //        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
-    //        (char*)"/home/nvidia/Music/thor_receive_rtsp_ai/model/skeleton_ex/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
-    //        &handle, flag, MAX_BATCH);
-
-    //arya
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-                QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-                QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
-                (char*)"/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/model/skeleton_ex/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
-                &handle, flag, MAX_BATCH);
+        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
+        (char*)"/home/nvidia/Music/thor_receive_rtsp_ai/model/people_new/QDEEP.OD.TINY.PERSON.V10N.CFG",
+        &handle, flag, MAX_BATCH);
+
 
     qDebug() << "[AI Log] QDEEP_CREATE_BATCH_OBJECT_DETECT res:" << QString("0x%1").arg(res, 8, 16, QChar('0')) << "handle:" << handle;
 
@@ -1118,16 +1052,20 @@ void MainWindow::init_models()
 void MainWindow::uninit_models()
 {
     yolo_stop();
-
     if (handle != nullptr) {
         QDEEP_API::QDEEP_STOP_OBJECT_DETECT(handle);
         QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(handle);
         handle = nullptr;
     }
-
     for (size_t i = 0; i < MAX_BATCH; ++i) {
-        if (box_list_vec[i]) { delete[] box_list_vec[i]; box_list_vec[i] = nullptr; }
-        if (buffer_vec[i]) { delete[] buffer_vec[i]; buffer_vec[i] = nullptr; }
+        if (box_list_vec[i]) {
+            delete[] box_list_vec[i];
+            box_list_vec[i] = nullptr;
+        }
+        if (buffer_vec[i]) {
+            delete[] buffer_vec[i];
+            buffer_vec[i] = nullptr;
+        }
     }
 }
 
@@ -1146,32 +1084,30 @@ void MainWindow::yolo_start()
     }
 
     if (active_camera_count == 0) {
-        qDebug() << "[Warning] No active cameras found! AI will not start.";
+        qDebug() << "[Warning] No active cameras found!";
         return;
     }
 
     ai_running = true;
     pAiThread = new std::thread(&MainWindow::ai_inference_thread, this);
-    qDebug() << "[Info] AI inference started.";
 }
 
 void MainWindow::yolo_stop()
 {
-    if (!ai_running) return;
+    ai_running = false;
+    cv.notify_all();
+
+    if (pAiThread) {
+        if (pAiThread->joinable()) {
+            pAiThread->join();
+        }
+        delete pAiThread;
+        pAiThread = nullptr;
+    }
 
     for (ChannelContext *ctx : channels) {
         ctx->m_bSendBuffer = false;
     }
-
-    ai_running = false;
-    cv.notify_one();
-
-    if (pAiThread && pAiThread->joinable()) {
-        pAiThread->join();
-        delete pAiThread;
-        pAiThread = nullptr;
-    }
-    qDebug() << "[Info] AI inference stopped.";
 }
 
 void MainWindow::ai_inference_thread()
@@ -1180,7 +1116,7 @@ void MainWindow::ai_inference_thread()
     int inference_count = 0;
 
     while (ai_running) {
-        // 重新計算 active camera 數量
+        // Re-calculate active camera count
         active_camera_count = 0;
         for (ChannelContext *ctx : channels) {
             if (ctx->m_bSendBuffer && ctx->m_nVideoWidth > 0 && ctx->m_nVideoHeight > 0) {
@@ -1216,7 +1152,7 @@ void MainWindow::ai_inference_thread()
                     pLatest = pBuf;
                 }
 
-                // Copy latest frame data to buffer_vec for QDEEP (NV12 format)
+                // Copy latest frame data to buffer_vec for QDEEP
                 if (pLatest) {
                     has_any_frame = true;
                     PVOID pLockedData = qcap2_rcbuffer_lock_data(pLatest);
@@ -1231,12 +1167,10 @@ void MainWindow::ai_inference_thread()
                             ULONG copyWidth = 640;
                             ULONG copyHeight = 384;
                             if (pDstBuf) {
-                                // Copy Y plane
                                 int src_pitch_Y = pStride[0];
                                 for (ULONG row = 0; row < copyHeight; ++row) {
                                     memcpy(pDstBuf + row * copyWidth, pBuffer[0] + row * src_pitch_Y, copyWidth);
                                 }
-                                // Copy UV plane
                                 if (pBuffer[1] && pStride[1] > 0) {
                                     int src_pitch_UV = pStride[1];
                                     BYTE* pDstUV = pDstBuf + (copyWidth * copyHeight);
@@ -1271,7 +1205,7 @@ void MainWindow::ai_inference_thread()
             continue;
         }
 
-        // 重置 box sizes
+        // Reset box sizes
         for (size_t i = 0; i < MAX_BATCH; ++i) {
             box_size_vec[i] = BOX_SIZE;
         }
@@ -1289,12 +1223,12 @@ void MainWindow::ai_inference_thread()
             qDebug() << "[AI Performance] QDEEP Inference took" << (inference_end - inference_start) * 1000.0 << "ms";
         }
 
-        // 記錄 AI FPS（每 5 秒輸出一次）
+        // Log AI FPS every 5 seconds
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count();
         if (elapsed >= 5) {
             double ai_fps = (double)inference_count / elapsed;
-            qDebug() << QString("[AI FPS 17kps] %1 Hz (%2 inferences in %3s, active=%4)")
+            qDebug() << QString("[AI FPS people] %1 Hz (%2 inferences in %3s, active=%4)")
                         .arg(ai_fps, 0, 'f', 1)
                         .arg(inference_count)
                         .arg(elapsed)
@@ -1303,23 +1237,21 @@ void MainWindow::ai_inference_thread()
             last_log_time = now;
         }
 
-        // 處理推論結果，更新 draw_persons，以便 display 執行緒/callback 繪圖顯示
+        // Process results and update draw_boxes
         {
             std::lock_guard<std::mutex> draw_lock(draw_mtx);
             for (int i = 0; i < MAX_BATCH; ++i) {
-                draw_persons[i].clear();
+                draw_boxes[i].clear();
                 if (width_vec[i] > 0 && buffer_vec[i] != nullptr && api_res == QCAP_RS_SUCCESSFUL) {
                     for (ULONG j = 0; j < box_size_vec[i]; ++j) {
                         auto& deep_box = box_list_vec[i][j];
-                        DrawPerson person;
-                        person.classId = deep_box.nClassID;
-                        person.probability = deep_box.fProbability;
-                        for (int k = 0; k < 17; ++k) {
-                            person.keypoints[k].x = deep_box.sKeypoints[k].nX;
-                            person.keypoints[k].y = deep_box.sKeypoints[k].nY;
-                            person.keypoints[k].probability = deep_box.sKeypoints[k].fProbability;
-                        }
-                        draw_persons[i].push_back(person);
+                        DrawBox box;
+                        box.x = deep_box.nX;
+                        box.y = deep_box.nY;
+                        box.width = deep_box.nWidth;
+                        box.height = deep_box.nHeight;
+                        box.probability = deep_box.fProbability;
+                        draw_boxes[i].push_back(box);
                     }
                 }
             }
