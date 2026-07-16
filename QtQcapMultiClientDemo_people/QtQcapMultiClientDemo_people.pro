@@ -26,7 +26,7 @@ QMAKE_LFLAGS += -Wl,-rpath,$$PWD/../lib \
                 -Wl,-rpath,$$PWD/../qdeep/lib
 
 LIBS += -L$$PWD/../lib -lqcap -lqcap2_rcbuffer -lQDEEP
-LIBS += -L$$PWD/../qdeep/lib -lQDEEP
+#LIBS += -L$$PWD/../qdeep/lib -lQDEEP
 
 CONFIG += link_pkgconfig
 PKGCONFIG += opencv4

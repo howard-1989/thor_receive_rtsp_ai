@@ -832,10 +832,18 @@ void MainWindow::onBtnStartClicked()
 
     int count = spinChannelCount->value();
     int cols = 2;
-    if (count <= 2) cols = count;
-    else if (count <= 4) cols = 2;
-    else if (count <= 9) cols = 3;
-    else cols = 4;
+    if (m_bFullscreen) {
+        if (count >= 17) {
+            cols = 8;
+        } else {
+            cols = 4;
+        }
+    } else {
+        if (count <= 2) cols = count;
+        else if (count <= 4) cols = 2;
+        else if (count <= 9) cols = 3;
+        else cols = 4;
+    }
 
     for (int i = 0; i < count; ++i) {
         QFrame *frame = new QFrame(videoContainer);
@@ -953,7 +961,11 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
         if (count > 0) {
             int cols = 2;
             if (m_bFullscreen) {
-                cols = 8;
+                if (count >= 17) {
+                    cols = 8;
+                } else {
+                    cols = 4;
+                }
             } else {
                 if (count <= 2) cols = count;
                 else if (count <= 4) cols = 2;
@@ -1003,11 +1015,17 @@ void MainWindow::init_models()
         buffer_len_vec[i] = MAX_BUFFER_SIZE;
     }
 
+//    QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
+//        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+//        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
+//        (char*)"/home/nvidia/Music/thor_receive_rtsp_ai/model/people/QDEEP.OD.TINY.PERSON.V10N.CFG",
+//        &handle, flag, MAX_BATCH);
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
         QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
         QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-        (char*)"/home/nvidia/Music/thor_receive_rtsp_ai/model/people/QDEEP.OD.TINY.PERSON.V10N.CFG",
+        (char*)"/home/nvidia/Downloads/arya/sdvoe_bacth/demo/model/people/QDEEP.OD.TINY.PERSON.V10N.CFG",
         &handle, flag, MAX_BATCH);
+
 
     qDebug() << "[AI Log] QDEEP_CREATE_BATCH_OBJECT_DETECT res:" << QString("0x%1").arg(res, 8, 16, QChar('0')) << "handle:" << handle;
 

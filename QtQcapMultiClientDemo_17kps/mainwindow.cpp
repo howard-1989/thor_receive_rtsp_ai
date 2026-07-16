@@ -894,10 +894,18 @@ void MainWindow::onBtnStartClicked()
     int count = spinChannelCount->value();
 
     int cols = 2;
-    if (count <= 2) cols = count;
-    else if (count <= 4) cols = 2;
-    else if (count <= 9) cols = 3;
-    else cols = 4;
+    if (m_bFullscreen) {
+        if (count >= 17) {
+            cols = 8;
+        } else {
+            cols = 4;
+        }
+    } else {
+        if (count <= 2) cols = count;
+        else if (count <= 4) cols = 2;
+        else if (count <= 9) cols = 3;
+        else cols = 4;
+    }
 
     for (int i = 0; i < count; ++i) {
         QFrame *frame = new QFrame(videoContainer);
@@ -1022,7 +1030,11 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
         if (count > 0) {
             int cols = 2;
             if (m_bFullscreen) {
-                cols = 8;
+                if (count >= 17) {
+                    cols = 8;
+                } else {
+                    cols = 4;
+                }
             } else {
                 if (count <= 2) cols = count;
                 else if (count <= 4) cols = 2;
