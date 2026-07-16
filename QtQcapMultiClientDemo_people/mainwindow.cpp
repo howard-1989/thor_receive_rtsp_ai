@@ -1015,15 +1015,10 @@ void MainWindow::init_models()
         buffer_len_vec[i] = MAX_BUFFER_SIZE;
     }
 
-//    QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-//        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-//        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-//        (char*)"/home/nvidia/Music/thor_receive_rtsp_ai/model/people/QDEEP.OD.TINY.PERSON.V10N.CFG",
-//        &handle, flag, MAX_BATCH);
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
         QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
         QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-        (char*)"/home/nvidia/Downloads/arya/sdvoe_bacth/demo/model/people/QDEEP.OD.TINY.PERSON.V10N.CFG",
+        (char*)"/home/nvidia/Music/thor_receive_rtsp_ai/model/people_new/QDEEP.OD.TINY.PERSON.V10N.CFG",
         &handle, flag, MAX_BATCH);
 
 
