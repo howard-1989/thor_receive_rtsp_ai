@@ -524,6 +524,7 @@ QRETURN ChannelContext::onEventVdec() {
     qcap2_video_scaler_t* pLocalScaler2 = nullptr;
     bool bDisplayEnabled = false;
     bool bSendBuffer = false;
+    double dSourceFrameRate = DEFAULT_AI_TARGET_FPS;
     qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
 
     {
@@ -533,6 +534,7 @@ QRETURN ChannelContext::onEventVdec() {
         pLocalScaler2 = pScaler2;
         bDisplayEnabled = m_bDisplayEnabled;
         bSendBuffer = m_bSendBuffer;
+        dSourceFrameRate = m_dVideoFrameRate;
         pLocalAIQueue = m_pAIQueue;
     }
 
@@ -569,8 +571,12 @@ QRETURN ChannelContext::onEventVdec() {
     if (pScaledBuffer) {
         // ── Destination 1: Push to AI queue (non-blocking) ──────────────────
         if (bSendBuffer && g_pMainwindow && g_pMainwindow->ai_running && pLocalAIQueue) {
-            double current_time = QCAP_GET_TIME();
-            if ((current_time - m_lastProcessTime) >= FRAME_INTERVAL) {
+            // Follow the frame rate reported by the RTSP connected callback.
+            // Some devices report 0 fps, so keep a safe fallback in that case.
+            const double targetFps = dSourceFrameRate > 0.0 ? dSourceFrameRate : DEFAULT_AI_TARGET_FPS;
+            const double frameInterval = 1.0 / targetFps;
+            const double current_time = QCAP_GET_TIME();
+            if ((current_time - m_lastProcessTime) >= frameInterval) {
                 m_lastProcessTime = current_time;
 
                 // If queue full, drop oldest frame to make room
@@ -1075,10 +1081,16 @@ void MainWindow::init_models()
         buffer_len_vec[i] = MAX_BUFFER_SIZE;
     }
 
+    // QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
+    //     QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+    //     QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
+    //     (char*)"/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/model/tw/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG",
+    //     &handle, flag, MAX_BATCH);
+
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
         QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
         QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-        (char*)"/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/model/tw/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG",
+        (char*)"/home/nvidia/qdeep/demo/model/traffic_Batch64/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG",
         &handle, flag, MAX_BATCH);
 
 
@@ -1086,7 +1098,7 @@ void MainWindow::init_models()
 
     if (res == 0 && handle != nullptr) {
         QDEEP_API::QDEEP_START_OBJECT_DETECT(handle);
-        QDEEP_API::QDEEP_SET_OBJECT_DETECT_PROPERTY(handle, 0.1);
+        // QDEEP_API::QDEEP_SET_OBJECT_DETECT_PROPERTY(handle, 0.1);
     }
 
     res = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));
@@ -1205,6 +1217,10 @@ void MainWindow::ai_inference_thread()
         // ── Drain each channel's queue, copy latest frame to buffer_vec ──
         bool has_any_frame = false;
 
+        // MAX_BATCH is only the detector capacity.  Pack active UI channels into
+        // contiguous slots and pass the resulting count to QDEEP below.
+        std::vector<int> batch_channels;
+        batch_channels.reserve(active_camera_count);
         for (int i = 0; i < MAX_BATCH; ++i) {
             ChannelContext* ctx = nullptr;
             for (auto* c : channels) {
@@ -1215,6 +1231,9 @@ void MainWindow::ai_inference_thread()
             }
 
             if (ctx && ctx->m_bSendBuffer && ctx->m_nVideoWidth > 0 && ctx->m_nVideoHeight > 0 && ctx->m_pAIQueue) {
+                const size_t batch_index = batch_channels.size();
+                batch_channels.push_back(ctx->channelId);
+
                 // Drain queue: pop all, keep only the latest frame
                 qcap2_rcbuffer_t* pLatest = nullptr;
                 qcap2_rcbuffer_t* pBuf = nullptr;
@@ -1234,7 +1253,7 @@ void MainWindow::ai_inference_thread()
                         qcap2_av_frame_get_buffer1(pAVFrame, pBuffer, pStride);
 
                         if (pBuffer[0] && pStride[0] > 0) {
-                            BYTE* pDstBuf = buffer_vec[i];
+                            BYTE* pDstBuf = buffer_vec[batch_index];
                             ULONG copyWidth = 640;
                             ULONG copyHeight = 384;
                             if (pDstBuf) {
@@ -1249,7 +1268,7 @@ void MainWindow::ai_inference_thread()
                                         memcpy(pDstUV + row * copyWidth, pBuffer[1] + row * src_pitch_UV, copyWidth);
                                     }
                                 }
-                                buffer_len_vec[i] = (copyWidth * copyHeight * 3) / 2;
+                                buffer_len_vec[batch_index] = (copyWidth * copyHeight * 3) / 2;
                             }
                         }
                         qcap2_rcbuffer_unlock_data(pLatest);
@@ -1257,13 +1276,17 @@ void MainWindow::ai_inference_thread()
                     qcap2_rcbuffer_release(pLatest); // Release rcbuffer back to scaler pool
                 }
 
-                width_vec[i] = 640;
-                height_vec[i] = 384;
-            } else {
-                width_vec[i] = 0;
-                height_vec[i] = 0;
-                buffer_len_vec[i] = 0;
+                width_vec[batch_index] = 640;
+                height_vec[batch_index] = 384;
             }
+        }
+
+        const ULONG batch_size = static_cast<ULONG>(batch_channels.size());
+        active_camera_count = static_cast<int>(batch_size);
+        for (ULONG i = batch_size; i < MAX_BATCH; ++i) {
+            width_vec[i] = 0;
+            height_vec[i] = 0;
+            buffer_len_vec[i] = 0;
         }
 
         // If no channel has new frame, wait briefly to avoid busy-loop
@@ -1287,7 +1310,7 @@ void MainWindow::ai_inference_thread()
         const auto inference_start = std::chrono::steady_clock::now();
         QRESULT api_res = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
             handle, color_space.data(), width_vec.data(), height_vec.data(),
-            buffer_vec.data(), buffer_len_vec.data(), box_list_vec.data(), box_size_vec.data(), MAX_BATCH);
+            buffer_vec.data(), buffer_len_vec.data(), box_list_vec.data(), box_size_vec.data(), batch_size);
         const auto inference_end = std::chrono::steady_clock::now();
         const double api_ms = std::chrono::duration<double, std::milli>(inference_end - inference_start).count();
 
@@ -1301,7 +1324,7 @@ void MainWindow::ai_inference_thread()
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count();
         if (elapsed >= 5) {
             double ai_fps = (double)inference_count / elapsed;
-            qDebug() << QString("[AI QDEEP traffic] %1 Hz (%2 calls in %3s, active=%4, api_ms avg/min/max=%5/%6/%7)")
+            qDebug() << QString("[AI QDEEP traffic] %1 Hz (%2 calls in %3s, batch=%4, api_ms avg/min/max=%5/%6/%7)")
                         .arg(ai_fps, 0, 'f', 1)
                         .arg(inference_count)
                         .arg(elapsed)
@@ -1319,11 +1342,14 @@ void MainWindow::ai_inference_thread()
         // Process results and update draw_boxes
         {
             std::lock_guard<std::mutex> draw_lock(draw_mtx);
-            for (int i = 0; i < MAX_BATCH; ++i) {
-                draw_boxes[i].clear();
-                if (width_vec[i] > 0 && buffer_vec[i] != nullptr) {
-                    for (ULONG j = 0; j < box_size_vec[i]; ++j) {
-                        auto& deep_box = box_list_vec[i][j];
+            for (int channel_id : batch_channels) {
+                draw_boxes[channel_id].clear();
+            }
+            if (api_res == QCAP_RS_SUCCESSFUL) {
+                for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
+                    std::vector<DrawBox>& channel_boxes = draw_boxes[batch_channels[batch_index]];
+                    for (ULONG j = 0; j < box_size_vec[batch_index]; ++j) {
+                        auto& deep_box = box_list_vec[batch_index][j];
                         if (deep_box.fProbability < 0.75f) {
                             continue;
                         }
@@ -1334,10 +1360,10 @@ void MainWindow::ai_inference_thread()
                         box.height = deep_box.nHeight;
                         box.probability = deep_box.fProbability;
                         box.classID = deep_box.nClassID;
-                        draw_boxes[i].push_back(box);
+                        channel_boxes.push_back(box);
                     }
-                    if (box_size_vec[i] > 0) {
-                        // qDebug() << "[AI Debug] CH" << i + 1 << "detected" << box_size_vec[i] << "people, api_res:" << api_res;
+                    if (box_size_vec[batch_index] > 0) {
+                        // qDebug() << "[AI Debug] CH" << batch_channels[batch_index] + 1 << "detected" << box_size_vec[batch_index] << "objects";
                     }
                 }
             }
