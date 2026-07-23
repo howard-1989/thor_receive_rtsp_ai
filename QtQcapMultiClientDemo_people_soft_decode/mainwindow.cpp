@@ -1042,7 +1042,7 @@ void MainWindow::init_models()
 
     if (res == 0 && handle != nullptr) {
         QDEEP_API::QDEEP_START_OBJECT_DETECT(handle);
-        QDEEP_API::QDEEP_SET_OBJECT_DETECT_PROPERTY(handle, 0.1);
+        // QDEEP_API::QDEEP_SET_OBJECT_DETECT_PROPERTY(handle, 0.1);
     }
 
     res = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));

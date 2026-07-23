@@ -1075,10 +1075,16 @@ void MainWindow::init_models()
         buffer_len_vec[i] = MAX_BUFFER_SIZE;
     }
 
+    // QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
+    //     QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+    //     QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
+    //     (char*)"/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/model/tw/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG",
+    //     &handle, flag, MAX_BATCH);
+
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
         QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
         QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-        (char*)"/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/model/tw/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG",
+        (char*)"/home/nvidia/qdeep/demo/model/traffic_Batch64/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG",
         &handle, flag, MAX_BATCH);
 
 
@@ -1086,7 +1092,7 @@ void MainWindow::init_models()
 
     if (res == 0 && handle != nullptr) {
         QDEEP_API::QDEEP_START_OBJECT_DETECT(handle);
-        QDEEP_API::QDEEP_SET_OBJECT_DETECT_PROPERTY(handle, 0.1);
+        // QDEEP_API::QDEEP_SET_OBJECT_DETECT_PROPERTY(handle, 0.1);
     }
 
     res = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));
