@@ -3,7 +3,7 @@ dir=`pwd`
 export QCAP_LOG_LEVEL=0
 
 #for fd over1024
-#export LD_PRELOAD=/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/select2poll/libselect2poll.so
+export LD_PRELOAD=/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/select2poll/libselect2poll.so
 ulimit -n 8192
 #export LD_PRELOAD=/home/nvidia/Music/thor_receive_rtsp_ai/select2poll/libselect2poll.so
 

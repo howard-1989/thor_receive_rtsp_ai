@@ -1034,11 +1034,11 @@ void MainWindow::init_models()
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
         QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
         QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-        (char*)"/home/nvidia/Music/thor_receive_rtsp_ai/model/people_new/QDEEP.OD.TINY.PERSON.V10N.CFG",
+        (char*)"/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/model/tw/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG",
         &handle, flag, MAX_BATCH);
 
 
-    qDebug() << "[AI Log] QDEEP_CREATE_BATCH_OBJECT_DETECT res:" << QString("0x%1").arg(res, 8, 16, QChar('0')) << "handle:" << handle;
+    // qDebug() << "[AI Log] QDEEP_CREATE_BATCH_OBJECT_DETECT res:" << QString("0x%1").arg(res, 8, 16, QChar('0')) << "handle:" << handle;
 
     if (res == 0 && handle != nullptr) {
         QDEEP_API::QDEEP_START_OBJECT_DETECT(handle);
@@ -1242,7 +1242,7 @@ void MainWindow::ai_inference_thread()
             std::lock_guard<std::mutex> draw_lock(draw_mtx);
             for (int i = 0; i < MAX_BATCH; ++i) {
                 draw_boxes[i].clear();
-                if (width_vec[i] > 0 && buffer_vec[i] != nullptr && api_res == QCAP_RS_SUCCESSFUL) {
+                if (width_vec[i] > 0 && buffer_vec[i] != nullptr) {
                     for (ULONG j = 0; j < box_size_vec[i]; ++j) {
                         auto& deep_box = box_list_vec[i][j];
                         DrawBox box;
@@ -1252,6 +1252,9 @@ void MainWindow::ai_inference_thread()
                         box.height = deep_box.nHeight;
                         box.probability = deep_box.fProbability;
                         draw_boxes[i].push_back(box);
+                    }
+                    if (box_size_vec[i] > 0) {
+                        // qDebug() << "[AI Debug] CH" << i + 1 << "detected" << box_size_vec[i] << "people, api_res:" << api_res;
                     }
                 }
             }
