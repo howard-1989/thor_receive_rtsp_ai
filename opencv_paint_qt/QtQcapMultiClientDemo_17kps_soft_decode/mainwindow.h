@@ -14,6 +14,7 @@
 #include <QCheckBox>
 #include <QPointer>
 
+
 // Include QCAP headers
 #include "qcap.h"
 #include "qcap2.h"
@@ -37,16 +38,21 @@ namespace QDEEP_API {
 
 // ── AI Constants ────────────────────────────────────────────────────────────
 #define BOX_SIZE 100
-#define MAX_BATCH 64
+#define MAX_BATCH 8
 #define MAX_BUFFER_SIZE (1920 * 1080 * 3 / 2)
-#define TARGET_FPS 15.0
+#define TARGET_FPS 30.0
 #define FRAME_INTERVAL (1.0 / TARGET_FPS)
 
-struct DrawBox {
+// ── Skeleton Keypoint Structures ────────────────────────────────────────────
+struct DrawKeypoint {
     int x;
     int y;
-    int width;
-    int height;
+    float probability;
+};
+
+struct DrawPerson {
+    DrawKeypoint keypoints[17];
+    int classId;
     float probability;
 };
 
@@ -60,6 +66,7 @@ struct ChannelContext {
     qcap2_event_handlers_t* pEventHandlers;
     qcap2_event_t* pEvent_vdec;
     qcap2_video_scaler_t* pScaler2;
+    qcap2_rcbuffer_t* m_pScalerBuffers2[8];
     qcap2_rcbuffer_t* m_pCurrentAIRCBuffer;
     qcap2_rcbuffer_queue_t* m_pAIQueue;      // AI frame queue for pipeline optimization
 
@@ -121,6 +128,7 @@ protected:
     void closeEvent(QCloseEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
 
+
 private slots:
     void onBtnStartClicked();
     void onBtnStopClicked();
@@ -137,7 +145,7 @@ public:
     bool m_bFullscreen;
     bool m_bEnableDisplay;
     bool m_bHalfRefreshRate;
-    static const int MAX_CHANNELS = 64;
+    static const int MAX_CHANNELS = 16;
 
 public:
     void* handle;
@@ -157,7 +165,7 @@ public:
     int ready_count;
     int active_camera_count;
 
-    std::vector<DrawBox> draw_boxes[MAX_BATCH];
+    std::vector<DrawPerson> draw_persons[MAX_BATCH];
     std::mutex draw_mtx;
 
 private:
