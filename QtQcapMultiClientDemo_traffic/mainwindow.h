@@ -37,19 +37,11 @@ namespace QDEEP_API {
 
 // ── AI Constants ────────────────────────────────────────────────────────────
 #define BOX_SIZE 100
-#define MAX_BATCH 32
+#define MAX_BATCH 16
 #define MAX_BUFFER_SIZE (1920 * 1080 * 3 / 2)
-#define TARGET_FPS 30.0
+#define TARGET_FPS 15.0
 #define FRAME_INTERVAL (1.0 / TARGET_FPS)
 
-struct DrawBox {
-    int x;
-    int y;
-    int width;
-    int height;
-    float probability;
-    int classID;
-};
 
 struct ChannelContext {
     int channelId;
@@ -61,6 +53,8 @@ struct ChannelContext {
     qcap2_event_handlers_t* pEventHandlers;
     qcap2_event_t* pEvent_vdec;
     qcap2_video_scaler_t* pScaler2;
+    qcap2_video_scaler_t* pScaler3;
+    qcap2_rcbuffer_t* m_pScalerBuffers3[8];
     qcap2_rcbuffer_t* m_pCurrentAIRCBuffer;
     qcap2_rcbuffer_queue_t* m_pAIQueue;      // AI frame queue for pipeline optimization
 
@@ -129,7 +123,6 @@ private slots:
     void onDisplayToggled(bool checked);
     void onOverlayToggled(bool checked);
     void onHalfRefreshRateToggled(bool checked);
-    void onQdeepInferenceToggled(bool checked);
 
 public:
     bool m_bShowOverlay;
@@ -159,8 +152,6 @@ public:
     int ready_count;
     int active_camera_count;
 
-    std::vector<DrawBox> draw_boxes[MAX_BATCH];
-    std::mutex draw_mtx;
 
 private:
     void clearGrid();
@@ -171,7 +162,6 @@ private:
     void uninit_models();
     void yolo_start();
     void yolo_stop();
-    void discardQueuedAIFrames();
     void ai_inference_thread();
 
     // UI elements
@@ -185,7 +175,6 @@ private:
     QPushButton *btnStart;
     QPushButton *btnStop;
     QCheckBox *chkEnableDisplay;
-    QCheckBox *chkEnableQdeepInference;
     QCheckBox *chkShowOverlay;
     QCheckBox *chkHalfRefreshRate;
     QLabel *lblStatus;
