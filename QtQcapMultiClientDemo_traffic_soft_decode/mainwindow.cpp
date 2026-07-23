@@ -1188,6 +1188,9 @@ void MainWindow::ai_inference_thread()
 {
     auto last_log_time = std::chrono::steady_clock::now();
     int inference_count = 0;
+    double api_total_ms = 0.0;
+    double api_min_ms = 0.0;
+    double api_max_ms = 0.0;
 
     while (ai_running) {
         // Re-calculate active camera count
@@ -1284,30 +1287,38 @@ void MainWindow::ai_inference_thread()
             box_size_vec[i] = BOX_SIZE;
         }
 
-        double inference_start = QCAP_GET_TIME();
+        // steady_clock is monotonic, so this latency measurement is not affected by
+        // NTP/manual system-clock adjustments. It measures the full blocking time of
+        // the QDEEP API, including any internal upload, preprocessing, inference and wait.
+        const auto inference_start = std::chrono::steady_clock::now();
         QRESULT api_res = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
             handle, color_space.data(), width_vec.data(), height_vec.data(),
             buffer_vec.data(), buffer_len_vec.data(), box_list_vec.data(), box_size_vec.data(), MAX_BATCH);
-        double inference_end = QCAP_GET_TIME();
+        const auto inference_end = std::chrono::steady_clock::now();
+        const double api_ms = std::chrono::duration<double, std::milli>(inference_end - inference_start).count();
 
         inference_count++;
-
-        static int ai_log_cnt = 0;
-        if (++ai_log_cnt % 30 == 0) {
-            qDebug() << "[AI Performance] QDEEP Inference took" << (inference_end - inference_start) * 1000.0 << "ms";
-        }
+        api_total_ms += api_ms;
+        if (inference_count == 1 || api_ms < api_min_ms) api_min_ms = api_ms;
+        if (api_ms > api_max_ms) api_max_ms = api_ms;
 
         // Log AI FPS every 5 seconds
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count();
         if (elapsed >= 5) {
             double ai_fps = (double)inference_count / elapsed;
-            qDebug() << QString("[AI FPS people] %1 Hz (%2 inferences in %3s, active=%4)")
+            qDebug() << QString("[AI QDEEP traffic] %1 Hz (%2 calls in %3s, active=%4, api_ms avg/min/max=%5/%6/%7)")
                         .arg(ai_fps, 0, 'f', 1)
                         .arg(inference_count)
                         .arg(elapsed)
-                        .arg(active_camera_count);
+                        .arg(active_camera_count)
+                        .arg(api_total_ms / inference_count, 0, 'f', 2)
+                        .arg(api_min_ms, 0, 'f', 2)
+                        .arg(api_max_ms, 0, 'f', 2);
             inference_count = 0;
+            api_total_ms = 0.0;
+            api_min_ms = 0.0;
+            api_max_ms = 0.0;
             last_log_time = now;
         }
 

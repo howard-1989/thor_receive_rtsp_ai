@@ -38,9 +38,9 @@ namespace QDEEP_API {
 
 // ── AI Constants ────────────────────────────────────────────────────────────
 #define BOX_SIZE 100
-#define MAX_BATCH 8
+#define MAX_BATCH 16
 #define MAX_BUFFER_SIZE (1920 * 1080 * 3 / 2)
-#define TARGET_FPS 30.0
+#define TARGET_FPS 15.0
 #define FRAME_INTERVAL (1.0 / TARGET_FPS)
 
 // ── Skeleton Keypoint Structures ────────────────────────────────────────────
