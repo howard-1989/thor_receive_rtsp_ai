@@ -636,6 +636,7 @@ QRETURN ChannelContext::onEventVdec() {
     bool bDisplayEnabled = false;
     bool bSendBuffer = false;
     qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
+    double dSourceFrameRate = DEFAULT_AI_TARGET_FPS;
 
     {
         QMutexLocker locker(&m_mutex);
@@ -646,6 +647,7 @@ QRETURN ChannelContext::onEventVdec() {
         bDisplayEnabled = m_bDisplayEnabled;
         bSendBuffer = m_bSendBuffer;
         pLocalAIQueue = m_pAIQueue;
+        dSourceFrameRate = m_dVideoFrameRate;
     }
 
     //    qDebug() << "Trace: onEventVdec - popping frame from decoder...";
@@ -707,8 +709,10 @@ QRETURN ChannelContext::onEventVdec() {
             if (qres == QCAP_RS_SUCCESSFUL && pSysBuffer) {
                 // ── AI Frame Capture: Push to queue (non-blocking) ──────────────────
                 if (bSendBuffer && g_pMainwindow && g_pMainwindow->ai_running && pLocalAIQueue) {
-                    double current_time = QCAP_GET_TIME();
-                    if ((current_time - m_lastProcessTime) >= FRAME_INTERVAL) {
+                    const double targetFps = dSourceFrameRate > 0.0 ? dSourceFrameRate : DEFAULT_AI_TARGET_FPS;
+                    const double frameInterval = 1.0 / targetFps;
+                    const double current_time = QCAP_GET_TIME();
+                    if ((current_time - m_lastProcessTime) >= frameInterval) {
                         m_lastProcessTime = current_time;
 
                         // If queue full, drop oldest frame to make room
@@ -1191,6 +1195,8 @@ void MainWindow::ai_inference_thread()
 
         // ── Drain each channel's queue, copy latest frame to buffer_vec ──
         bool has_any_frame = false;
+        std::vector<int> batch_channels;
+        batch_channels.reserve(active_camera_count);
 
         for (int i = 0; i < MAX_BATCH; ++i) {
             ChannelContext* ctx = nullptr;
@@ -1202,6 +1208,7 @@ void MainWindow::ai_inference_thread()
             }
 
             if (ctx && ctx->m_bSendBuffer && ctx->m_nVideoWidth > 0 && ctx->m_nVideoHeight > 0 && ctx->m_pAIQueue) {
+                batch_channels.push_back(i);
                 // Drain queue: pop all, keep only the latest frame
                 qcap2_rcbuffer_t* pLatest = nullptr;
                 qcap2_rcbuffer_t* pBuf = nullptr;
@@ -1268,11 +1275,43 @@ void MainWindow::ai_inference_thread()
             box_size_vec[i] = BOX_SIZE;
         }
 
+        // Keep per-channel buffers/results for rendering, but submit only active
+        // channels as a compact QDEEP batch.
+        std::vector<ULONG> batch_color_space;
+        std::vector<ULONG> batch_width;
+        std::vector<ULONG> batch_height;
+        std::vector<BYTE*> batch_buffer;
+        std::vector<ULONG> batch_buffer_len;
+        std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> batch_box_list;
+        std::vector<ULONG> batch_box_size;
+        batch_color_space.reserve(batch_channels.size());
+        batch_width.reserve(batch_channels.size());
+        batch_height.reserve(batch_channels.size());
+        batch_buffer.reserve(batch_channels.size());
+        batch_buffer_len.reserve(batch_channels.size());
+        batch_box_list.reserve(batch_channels.size());
+        batch_box_size.reserve(batch_channels.size());
+        for (int channelId : batch_channels) {
+            batch_color_space.push_back(color_space[channelId]);
+            batch_width.push_back(width_vec[channelId]);
+            batch_height.push_back(height_vec[channelId]);
+            batch_buffer.push_back(buffer_vec[channelId]);
+            batch_buffer_len.push_back(buffer_len_vec[channelId]);
+            batch_box_list.push_back(box_list_vec[channelId]);
+            batch_box_size.push_back(box_size_vec[channelId]);
+        }
+        const ULONG batch_size = static_cast<ULONG>(batch_channels.size());
+        active_camera_count = static_cast<int>(batch_size);
+
         double inference_start = QCAP_GET_TIME();
         QRESULT api_res = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
-            handle, color_space.data(), width_vec.data(), height_vec.data(),
-            buffer_vec.data(), buffer_len_vec.data(), box_list_vec.data(), box_size_vec.data(), MAX_BATCH);
+            handle, batch_color_space.data(), batch_width.data(), batch_height.data(),
+            batch_buffer.data(), batch_buffer_len.data(), batch_box_list.data(), batch_box_size.data(), batch_size);
         double inference_end = QCAP_GET_TIME();
+
+        for (size_t batchIndex = 0; batchIndex < batch_channels.size(); ++batchIndex) {
+            box_size_vec[batch_channels[batchIndex]] = batch_box_size[batchIndex];
+        }
 
         inference_count++;
 
