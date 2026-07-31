@@ -17,13 +17,13 @@
 
 MainWindow *g_pMainwindow = nullptr;
 
-static const char* kTrafficModel =
-    "/home/nvidia/Music/thor_receive_rtsp_ai/model/traffic/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG";
-// Keep compatibility with the existing plate demo: until a real licence-plate
-// model is supplied, the second handle uses the local people model.  An
-// environment variable can replace it without rebuilding.
-static const char* kDefaultPlateModel =
-    "/home/nvidia/Music/thor_receive_rtsp_ai/model/people/QDEEP.OD.TINY.PERSON.V10N.CFG";
+// Layer 1 currently runs the same detector in all three independent workers.
+// Model_1 and model_2 can later be changed to their chained-model inputs
+// without changing queue ownership or worker lifecycle.
+static const char* kLayer1Model0 =
+    "/home/nvidia/Documents/new_model/taiwantraffic_batch8/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG";
+static const char* kLayer1Model1 = kLayer1Model0;
+static const char* kLayer1Model2 = kLayer1Model0;
 
 extern "C" {
 QDEEP_EXT_API QRESULT QDEEP_EXPORT QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(PVOID pDetector, ULONG* pCheckNum);
@@ -36,19 +36,9 @@ QImage cvMatToQImage(const cv::Mat& mat) {
     return QImage();
 }
 
-static std::string trafficClassName(int classId)
-{
-    switch (classId) {
-    case 0: return "Pedestrian";
-    case 1: return "Motorcycle";
-    case 2: return "Car";
-    case 3: return "Large Vehicle";
-    default: return "Class " + std::to_string(classId);
-    }
-}
-
 // Display is fed from an immutable CPU frame, never from a QCAP rcbuffer.
-// QDEEP receives the same SharedFrame through its own depth-two queue.
+// Each QDEEP worker holds a separate shared_ptr reference until its synchronous
+// API call completes, so no consumer can free pixels used by another consumer.
 static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFrame>& frame)
 {
     if (!ctx || !frame || !ctx->m_pLabel || !ctx->m_pPendingUpdate ||
@@ -68,23 +58,31 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
     cv::cvtColor(nv12Mat, bgrMat, cv::COLOR_YUV2BGR_NV12);
 
     if (g_pMainwindow && g_pMainwindow->m_bShowOverlay) {
-        std::vector<DrawBox> boxes;
+        std::vector<DrawBox> model0Boxes;
+        std::vector<DrawBox> model1Boxes;
+        std::vector<DrawBox> model2Boxes;
         {
             std::lock_guard<std::mutex> lock(g_pMainwindow->draw_mtx);
-            boxes = g_pMainwindow->draw_boxes[ctx->channelId];
+            model0Boxes = g_pMainwindow->layer1Model0DrawBoxes[ctx->channelId];
+            model1Boxes = g_pMainwindow->layer1Model1DrawBoxes[ctx->channelId];
+            model2Boxes = g_pMainwindow->layer1Model2DrawBoxes[ctx->channelId];
         }
         cv::putText(bgrMat, "CH " + std::to_string(ctx->channelId + 1), cv::Point(10, 25),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
-        for (const DrawBox& box : boxes) {
+        const auto drawBoxes = [&bgrMat](const std::vector<DrawBox>& boxes, const cv::Scalar& color) {
+            for (const DrawBox& box : boxes) {
             const int x = std::max(0, std::min(box.x, bgrMat.cols - 1));
             const int y = std::max(0, std::min(box.y, bgrMat.rows - 1));
             const int w = std::max(1, std::min(box.width, bgrMat.cols - x));
             const int h = std::max(1, std::min(box.height, bgrMat.rows - y));
-            const cv::Scalar color = box.isPlate ? cv::Scalar(0, 165, 255) : cv::Scalar(0, 255, 0);
             cv::rectangle(bgrMat, cv::Rect(x, y, w, h), color, 2);
             cv::putText(bgrMat, box.label.toStdString(), cv::Point(x, std::max(14, y - 4)),
                         cv::FONT_HERSHEY_SIMPLEX, 0.45, color, 2);
-        }
+            }
+        };
+        drawBoxes(model0Boxes, cv::Scalar(0, 255, 0));
+        drawBoxes(model1Boxes, cv::Scalar(255, 128, 0));
+        drawBoxes(model2Boxes, cv::Scalar(0, 255, 255));
     }
 
     const QImage image = cvMatToQImage(bgrMat);
@@ -96,176 +94,71 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
     }, Qt::QueuedConnection);
 }
 
-static std::shared_ptr<SharedFrame> copyScalerFrame(int channelId, qcap2_rcbuffer_t* pSysBuffer)
+static std::shared_ptr<SharedFrame> copyRawNV12Frame(
+    int channelId, const BYTE* source, ULONG sourceLength, ULONG width, ULONG height)
 {
-    if (!pSysBuffer) return nullptr;
-    PVOID pLockedData = qcap2_rcbuffer_lock_data(pSysBuffer);
-    if (!pLockedData) return nullptr;
-    qcap2_av_frame_t* pAVFrame = reinterpret_cast<qcap2_av_frame_t*>(pLockedData);
-    uint8_t* pBuffer[4] = {nullptr};
-    int pStride[4] = {0};
-    qcap2_av_frame_get_buffer1(pAVFrame, pBuffer, pStride);
-    ULONG colorSpace = 0;
-    ULONG width = 0;
-    ULONG height = 0;
-    qcap2_av_frame_get_video_property(pAVFrame, &colorSpace, &width, &height);
-    const bool validNV12 = colorSpace == QCAP_COLORSPACE_TYPE_NV12 && width > 0 && height > 0 &&
-                           pBuffer[0] && pBuffer[1] && pStride[0] >= static_cast<int>(width) &&
-                           pStride[1] >= static_cast<int>(width);
+    const size_t expectedBytes = static_cast<size_t>(width) * height * 3 / 2;
+    if (!source || width == 0 || height == 0 || sourceLength < expectedBytes) return nullptr;
+    std::shared_ptr<SharedFrame> frame = std::make_shared<SharedFrame>();
+    frame->channelId = channelId;
+    frame->width = width;
+    frame->height = height;
+    frame->nv12.assign(source, source + expectedBytes);
+    return frame;
+}
+
+// QCAP owns the callback rcbuffer. We lock it once, copy it directly into an
+// application-owned SharedFrame, and only unlock it. This code never calls
+// release on the callback buffer, so it cannot steal or double-release QCAP's
+// reference.
+static std::shared_ptr<SharedFrame> copyQcapFrame(int channelId, qcap2_rcbuffer_t* sourceBuffer)
+{
+    if (!sourceBuffer) return nullptr;
+    PVOID locked = qcap2_rcbuffer_lock_data(sourceBuffer);
+    if (!locked) return nullptr;
+    qcap2_av_frame_t* avFrame = reinterpret_cast<qcap2_av_frame_t*>(locked);
+    uint8_t* source[4] = {nullptr};
+    int stride[4] = {0};
+    ULONG colorSpace = 0, width = 0, height = 0;
+    qcap2_av_frame_get_buffer1(avFrame, source, stride);
+    qcap2_av_frame_get_video_property(avFrame, &colorSpace, &width, &height);
+
+    const bool nv12 = colorSpace == QCAP_COLORSPACE_TYPE_NV12;
+    const bool i420 = colorSpace == QCAP_COLORSPACE_TYPE_I420;
+    const bool yv12 = colorSpace == QCAP_COLORSPACE_TYPE_YV12;
+    const bool valid = width > 0 && height > 0 && !(width & 1) && !(height & 1) &&
+        source[0] && stride[0] >= static_cast<int>(width) &&
+        ((nv12 && source[1] && stride[1] >= static_cast<int>(width)) ||
+         ((i420 || yv12) && source[1] && source[2] &&
+          stride[1] >= static_cast<int>(width / 2) && stride[2] >= static_cast<int>(width / 2)));
     std::shared_ptr<SharedFrame> frame;
-    if (validNV12) {
+    if (valid) {
         frame = std::make_shared<SharedFrame>();
         frame->channelId = channelId;
         frame->width = width;
         frame->height = height;
-        frame->nv12.resize(width * height * 3 / 2);
-        for (ULONG row = 0; row < height; ++row) {
-            memcpy(frame->nv12.data() + row * width, pBuffer[0] + row * pStride[0], width);
-        }
-        BYTE* pDstUV = frame->nv12.data() + width * height;
-        for (ULONG row = 0; row < height / 2; ++row) {
-            memcpy(pDstUV + row * width, pBuffer[1] + row * pStride[1], width);
-        }
-    }
-    qcap2_rcbuffer_unlock_data(pSysBuffer);
-    return validNV12 ? frame : nullptr;
-}
-
-// The decoded-frame callback owns pFrameBuffer only for its duration.  Copy
-// it once into an application-owned SYSBUF before returning from the callback.
-// The owned buffer can then be referenced by both independent queues without
-// ever retaining or locking a QCAP decoder buffer outside the callback.
-static qcap2_rcbuffer_t* copyDecodedNV12ToRCBuffer(
-    const BYTE* pFrameBuffer, ULONG nFrameBufferLen, ULONG width, ULONG height)
-{
-    const ULONG expectedBytes = width * height * 3 / 2;
-    if (!pFrameBuffer || width == 0 || height == 0 || nFrameBufferLen < expectedBytes) {
-        return nullptr;
-    }
-
-    qcap2_rcbuffer_t* pClone = qcap2_rcbuffer_new_av_frame();
-    if (!pClone) return nullptr;
-
-    PVOID pCloneData = qcap2_rcbuffer_lock_data(pClone);
-    if (!pCloneData) {
-        qcap2_rcbuffer_release(pClone);
-        return nullptr;
-    }
-    qcap2_av_frame_t* pCloneFrame = reinterpret_cast<qcap2_av_frame_t*>(pCloneData);
-    uint8_t* pDest[4] = {nullptr};
-    int destStride[4] = {0};
-    qcap2_av_frame_set_video_property(pCloneFrame, QCAP_COLORSPACE_TYPE_NV12, width, height);
-    const bool allocated = qcap2_av_frame_alloc_buffer(pCloneFrame, 32, 1);
-    if (allocated) qcap2_av_frame_get_buffer1(pCloneFrame, pDest, destStride);
-    const bool validNV12 = allocated && pDest[0] && pDest[1] &&
-                           destStride[0] >= static_cast<int>(width) &&
-                           destStride[1] >= static_cast<int>(width);
-    if (validNV12) {
-        const BYTE* pSourceY = pFrameBuffer;
-        const BYTE* pSourceUV = pFrameBuffer + width * height;
-        for (ULONG row = 0; row < height; ++row) {
-            memcpy(pDest[0] + row * destStride[0], pSourceY + row * width, width);
-        }
-        for (ULONG row = 0; row < height / 2; ++row) {
-            memcpy(pDest[1] + row * destStride[1], pSourceUV + row * width, width);
-        }
-    }
-    qcap2_rcbuffer_unlock_data(pClone);
-    if (!validNV12) {
-        qcap2_rcbuffer_release(pClone);
-        return nullptr;
-    }
-    return pClone;
-}
-
-// QCAP decoded callbacks normally provide a ref-counted AVFrame handle, not
-// a direct pixel pointer.  Lock it only in the callback, copy its planes into
-// an application-owned NV12 frame, then unlock it before returning.
-static qcap2_rcbuffer_t* copyQcapDecodedFrameToNV12RCBuffer(qcap2_rcbuffer_t* pQcapFrame)
-{
-    if (!pQcapFrame) return nullptr;
-
-    PVOID pSourceData = qcap2_rcbuffer_lock_data(pQcapFrame);
-    if (!pSourceData) return nullptr;
-
-    qcap2_av_frame_t* pSourceFrame = reinterpret_cast<qcap2_av_frame_t*>(pSourceData);
-    uint8_t* pSource[4] = {nullptr};
-    int sourceStride[4] = {0};
-    ULONG colorSpace = 0;
-    ULONG width = 0;
-    ULONG height = 0;
-    qcap2_av_frame_get_buffer1(pSourceFrame, pSource, sourceStride);
-    qcap2_av_frame_get_video_property(pSourceFrame, &colorSpace, &width, &height);
-
-    const bool isNV12 = colorSpace == QCAP_COLORSPACE_TYPE_NV12;
-    const bool isI420 = colorSpace == QCAP_COLORSPACE_TYPE_I420;
-    const bool isYV12 = colorSpace == QCAP_COLORSPACE_TYPE_YV12;
-    const bool validSource = width > 0 && height > 0 && pSource[0] &&
-                             sourceStride[0] >= static_cast<int>(width) &&
-                             ((isNV12 && pSource[1] && sourceStride[1] >= static_cast<int>(width)) ||
-                              ((isI420 || isYV12) && pSource[1] && pSource[2] &&
-                               sourceStride[1] >= static_cast<int>(width / 2) &&
-                               sourceStride[2] >= static_cast<int>(width / 2)));
-    if (!validSource) {
-        qcap2_rcbuffer_unlock_data(pQcapFrame);
-        return nullptr;
-    }
-
-    qcap2_rcbuffer_t* pClone = qcap2_rcbuffer_new_av_frame();
-    if (!pClone) {
-        qcap2_rcbuffer_unlock_data(pQcapFrame);
-        return nullptr;
-    }
-    PVOID pCloneData = qcap2_rcbuffer_lock_data(pClone);
-    if (!pCloneData) {
-        qcap2_rcbuffer_unlock_data(pQcapFrame);
-        qcap2_rcbuffer_release(pClone);
-        return nullptr;
-    }
-
-    qcap2_av_frame_t* pCloneFrame = reinterpret_cast<qcap2_av_frame_t*>(pCloneData);
-    uint8_t* pDest[4] = {nullptr};
-    int destStride[4] = {0};
-    qcap2_av_frame_set_video_property(pCloneFrame, QCAP_COLORSPACE_TYPE_NV12, width, height);
-    const bool allocated = qcap2_av_frame_alloc_buffer(pCloneFrame, 32, 1);
-    if (allocated) qcap2_av_frame_get_buffer1(pCloneFrame, pDest, destStride);
-    const bool validDest = allocated && pDest[0] && pDest[1] &&
-                           destStride[0] >= static_cast<int>(width) &&
-                           destStride[1] >= static_cast<int>(width);
-    if (validDest) {
-        for (ULONG row = 0; row < height; ++row) {
-            memcpy(pDest[0] + row * destStride[0], pSource[0] + row * sourceStride[0], width);
-        }
-        if (isNV12) {
-            for (ULONG row = 0; row < height / 2; ++row) {
-                memcpy(pDest[1] + row * destStride[1], pSource[1] + row * sourceStride[1], width);
-            }
+        frame->nv12.resize(static_cast<size_t>(width) * height * 3 / 2);
+        for (ULONG row = 0; row < height; ++row)
+            memcpy(frame->nv12.data() + row * width, source[0] + row * stride[0], width);
+        BYTE* dstUV = frame->nv12.data() + static_cast<size_t>(width) * height;
+        if (nv12) {
+            for (ULONG row = 0; row < height / 2; ++row)
+                memcpy(dstUV + row * width, source[1] + row * stride[1], width);
         } else {
-            // I420 is Y/U/V; YV12 is Y/V/U.  QDEEP and the renderer both
-            // consume NV12, so interleave the source chroma into U/V pairs.
-            uint8_t* pSourceU = isI420 ? pSource[1] : pSource[2];
-            uint8_t* pSourceV = isI420 ? pSource[2] : pSource[1];
-            const int sourceStrideU = isI420 ? sourceStride[1] : sourceStride[2];
-            const int sourceStrideV = isI420 ? sourceStride[2] : sourceStride[1];
+            const BYTE* sourceU = i420 ? source[1] : source[2];
+            const BYTE* sourceV = i420 ? source[2] : source[1];
+            const int strideU = i420 ? stride[1] : stride[2];
+            const int strideV = i420 ? stride[2] : stride[1];
             for (ULONG row = 0; row < height / 2; ++row) {
-                BYTE* pUV = pDest[1] + row * destStride[1];
-                const BYTE* pU = pSourceU + row * sourceStrideU;
-                const BYTE* pV = pSourceV + row * sourceStrideV;
                 for (ULONG col = 0; col < width / 2; ++col) {
-                    pUV[col * 2] = pU[col];
-                    pUV[col * 2 + 1] = pV[col];
+                    dstUV[row * width + col * 2] = sourceU[row * strideU + col];
+                    dstUV[row * width + col * 2 + 1] = sourceV[row * strideV + col];
                 }
             }
         }
     }
-
-    qcap2_rcbuffer_unlock_data(pClone);
-    qcap2_rcbuffer_unlock_data(pQcapFrame);
-    if (!validDest) {
-        qcap2_rcbuffer_release(pClone);
-        return nullptr;
-    }
-    return pClone;
+    qcap2_rcbuffer_unlock_data(sourceBuffer);
+    return frame;
 }
 
 // ── Static callback functions delegating to ChannelContext ──────────────────
@@ -526,29 +419,22 @@ QRETURN ChannelContext::onDecodedVideoFrame(
 
     if (!bSendBuffer && !bDisplayEnabled) return QCAP_RT_OK;
 
-    // QCAP's decoder callback normally supplies a tagged rcbuffer handle.
-    // Never memcpy pFrameBuffer until the handle has been locked and its
-    // AVFrame planes/strides have been read.
+    // Complete the application-owned copy before this callback returns. The
+    // QCAP callback buffer is only locked/unlocked here; it is never released
+    // by this application.
     qcap2_rcbuffer_t* pQcapFrame = qcap2_rcbuffer_cast(pFrameBuffer, nFrameBufferLen);
-    qcap2_rcbuffer_t* pOwnedFrame = pQcapFrame
-        ? copyQcapDecodedFrameToNV12RCBuffer(pQcapFrame)
-        : copyDecodedNV12ToRCBuffer(pFrameBuffer, nFrameBufferLen, width, height);
-    if (!pOwnedFrame) {
+    std::shared_ptr<SharedFrame> frame = pQcapFrame
+        ? copyQcapFrame(channelId, pQcapFrame)
+        : copyRawNV12Frame(channelId, pFrameBuffer, nFrameBufferLen, width, height);
+    if (!frame) {
         qWarning() << "[QCAP decoder] CH" << channelId
                    << "cannot copy decoded SYSBUF:" << nFrameBufferLen
                    << "bytes for" << width << "x" << height;
         return QCAP_RT_OK;
     }
 
-    // Convert the temporary owned rcbuffer into one immutable SharedFrame.
-    // From this point both queues use only std::shared_ptr ownership; no
-    // queue can retain/release a QCAP rcbuffer.
-    std::shared_ptr<SharedFrame> frame = copyScalerFrame(channelId, pOwnedFrame);
-    qcap2_rcbuffer_release(pOwnedFrame);
-    if (!frame) {
-        qWarning() << "[QCAP decoder] CH" << channelId << "cannot build SharedFrame";
-        return QCAP_RT_OK;
-    }
+    // Both consumers receive a shared ownership reference only after the copy
+    // above is complete. Their queues do not contain any QCAP rcbuffer.
     if (bDisplayEnabled) {
         enqueueDisplayFrame(frame);
     }
@@ -578,24 +464,27 @@ MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), m_bFullscreen(false),
       // AI init
       m_bShowOverlay(true), m_bHalfRefreshRate(false),
-      trafficHandle(nullptr), plateHandle(nullptr), flag(1),
-      ai_running(false), pAiThread(nullptr), pTrafficAiThread(nullptr), pPlateAiThread(nullptr), pDisplayThread(nullptr),
+      layer1Model0Handle(nullptr), layer1Model1Handle(nullptr), layer1Model2Handle(nullptr), flag(1),
+      ai_running(false), pAiThread(nullptr), pLayer1Model0Thread(nullptr), pLayer1Model1Thread(nullptr), pLayer1Model2Thread(nullptr), pDisplayThread(nullptr),
       ready_count(0), active_camera_count(0),
-      trafficModelPath(QString::fromLatin1(kTrafficModel)),
-      plateModelPath(qEnvironmentVariable("QDEEP_PLATE_MODEL", QString::fromLatin1(kDefaultPlateModel))),
-      plateModelReady(false), traffic_next_channel(0), plate_next_channel(0), display_next_channel(0)
+      layer1Model0Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_0", QString::fromLatin1(kLayer1Model0))),
+      layer1Model1Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_1", QString::fromLatin1(kLayer1Model1))),
+      layer1Model2Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_2", QString::fromLatin1(kLayer1Model2))),
+      layer1Model0Ready(false), layer1Model1Ready(false), layer1Model2Ready(false),
+      layer1Model0NextChannel(0), layer1Model1NextChannel(0), layer1Model2NextChannel(0)
 {
-    setWindowTitle("QCAP Multichannel RTSP + QDEEP Traffic + Plate Pipeline");
+    setWindowTitle("QCAP Multichannel RTSP + Layer 1 model_0 / model_1 / model_2");
     resize(1280, 720);
 
     g_pMainwindow = this;
 
     // ── Initialize AI members ────────────────────────────────────────────
-    box_list_vec.assign(MAX_BATCH, nullptr);
-    plate_box_list_vec.assign(MAX_BATCH, nullptr);
-    traffic_frames.assign(MAX_BATCH, nullptr);
-    plate_frames.assign(MAX_BATCH, nullptr);
-    display_frames.assign(MAX_BATCH, nullptr);
+    layer1Model0BoxLists.assign(MAX_BATCH, nullptr);
+    layer1Model1BoxLists.assign(MAX_BATCH, nullptr);
+    layer1Model2BoxLists.assign(MAX_BATCH, nullptr);
+    layer1Model0Frames.assign(MAX_BATCH, nullptr);
+    layer1Model1Frames.assign(MAX_BATCH, nullptr);
+    layer1Model2Frames.assign(MAX_BATCH, nullptr);
 
     centralWidget = new QWidget(this);
     setCentralWidget(centralWidget);
@@ -616,7 +505,7 @@ MainWindow::MainWindow(QWidget *parent)
     grpLayout->addWidget(new QLabel("Channel Count (1-8):"));
     spinChannelCount = new QSpinBox(grpConfig);
     spinChannelCount->setRange(1, MAX_CHANNELS);
-    spinChannelCount->setValue(8);
+    spinChannelCount->setValue(4);
     grpLayout->addWidget(spinChannelCount);
 
     grpLayout->addWidget(new QLabel("RTSP URLs:"));
@@ -864,85 +753,69 @@ void MainWindow::onHalfRefreshRateToggled(bool checked)
 void MainWindow::init_models()
 {
     for (int i = 0; i < MAX_BATCH; ++i) {
-        box_list_vec[i] = new QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX[BOX_SIZE];
-        plate_box_list_vec[i] = new QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX[BOX_SIZE];
+        layer1Model0BoxLists[i] = new QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX[BOX_SIZE];
+        layer1Model1BoxLists[i] = new QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX[BOX_SIZE];
+        layer1Model2BoxLists[i] = new QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX[BOX_SIZE];
     }
 
-//    QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-//        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-//        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-//        trafficModelPath.toLocal8Bit().data(), &trafficHandle, flag, QDEEP_MODEL_BATCH_SIZE);
+    const auto startModel = [this](const char* name, const QString& path, ULONG config, void** handle) {
+        if (!QFileInfo::exists(path)) {
+            qCritical() << "[" << name << "model] not found:" << path;
+            return false;
+        }
+        const QRESULT result = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
+            QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0, config, path.toLocal8Bit().data(),
+            handle, flag, QDEEP_MODEL_BATCH_SIZE);
+        if (result != QCAP_RS_SUCCESSFUL || !*handle) {
+            qCritical() << "[" << name << "model] create failed:" << path << "result=" << result;
+            return false;
+        }
+        const QRESULT startResult = QDEEP_API::QDEEP_START_OBJECT_DETECT(*handle);
+        if (startResult != QCAP_RS_SUCCESSFUL) {
+            qCritical() << "[" << name << "model] start failed:" << startResult;
+            QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(*handle);
+            *handle = nullptr;
+            return false;
+        }
+        return true;
+    };
 
-    QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-        "/home/nvidia/Downloads/arya/sdvoe_bacth/demo/model/taiwan_traffic_bath8/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG", &trafficHandle, flag, QDEEP_MODEL_BATCH_SIZE);
-
-    if (res == QCAP_RS_SUCCESSFUL && trafficHandle) {
-        QDEEP_API::QDEEP_START_OBJECT_DETECT(trafficHandle);
-    } else {
-        qCritical() << "[Traffic model] create failed:" << trafficModelPath << "result=" << res;
-    }
-
-    if (!QFileInfo::exists(plateModelPath)) {
-        qWarning() << "[Plate model] not found:" << plateModelPath
-                   << "-- set QDEEP_PLATE_MODEL to the plate .CFG file.";
-        res = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(
-            reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));
-        qDebug() << "[AI Log] QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS res:"
-                 << QString("0x%1").arg(res, 8, 16, QChar('0'));
-        return;
-    }
-
-//    res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-//        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-//        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-//        plateModelPath.toLocal8Bit().data(), &plateHandle, flag, QDEEP_MODEL_BATCH_SIZE);
-    res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-        "/home/nvidia/Downloads/arya/sdvoe_bacth/demo/model/people_bath8/QDEEP.OD.TINY.PERSON.V10N.CFG", &plateHandle, flag, QDEEP_MODEL_BATCH_SIZE);
-    if (res == QCAP_RS_SUCCESSFUL && plateHandle) {
-        QDEEP_API::QDEEP_START_OBJECT_DETECT(plateHandle);
-        plateModelReady = true;
-    } else {
-        qCritical() << "[Plate model] create failed:" << plateModelPath << "result=" << res;
-    }
-
-    res = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(
-        reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));
-    qDebug() << "[AI Log] QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS res:"
-             << QString("0x%1").arg(res, 8, 16, QChar('0'));
+    layer1Model0Ready = startModel("layer1/model_0", layer1Model0Path,
+               QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW, &layer1Model0Handle);
+    layer1Model1Ready = startModel("layer1/model_1", layer1Model1Path,
+               QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW, &layer1Model1Handle);
+    layer1Model2Ready = startModel("layer1/model_2", layer1Model2Path,
+               QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW, &layer1Model2Handle);
 }
 
 void MainWindow::uninit_models()
 {
     yolo_stop();
-    if (trafficHandle) {
-        QDEEP_API::QDEEP_STOP_OBJECT_DETECT(trafficHandle);
-        QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(trafficHandle);
-        trafficHandle = nullptr;
-    }
-    if (plateHandle) {
-        QDEEP_API::QDEEP_STOP_OBJECT_DETECT(plateHandle);
-        QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(plateHandle);
-        plateHandle = nullptr;
-    }
+    const auto stopModel = [](void*& handle) {
+        if (!handle) return;
+        QDEEP_API::QDEEP_STOP_OBJECT_DETECT(handle);
+        QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(handle);
+        handle = nullptr;
+    };
+    stopModel(layer1Model0Handle);
+    stopModel(layer1Model1Handle);
+    stopModel(layer1Model2Handle);
+    layer1Model0Ready = false;
+    layer1Model1Ready = false;
+    layer1Model2Ready = false;
     for (size_t i = 0; i < MAX_BATCH; ++i) {
-        if (box_list_vec[i]) {
-            delete[] box_list_vec[i];
-            box_list_vec[i] = nullptr;
-        }
-        if (plate_box_list_vec[i]) {
-            delete[] plate_box_list_vec[i];
-            plate_box_list_vec[i] = nullptr;
-        }
+        delete[] layer1Model0BoxLists[i];
+        delete[] layer1Model1BoxLists[i];
+        delete[] layer1Model2BoxLists[i];
+        layer1Model0BoxLists[i] = nullptr;
+        layer1Model1BoxLists[i] = nullptr;
+        layer1Model2BoxLists[i] = nullptr;
     }
 }
 
 void MainWindow::yolo_start()
 {
-    if (ai_running.load() || !trafficHandle) return;
+    if (ai_running.load() || !layer1Model0Handle) return;
 
     active_camera_count = 0;
     for (ChannelContext *ctx : channels) {
@@ -961,10 +834,11 @@ void MainWindow::yolo_start()
 
     ai_running.store(true);
     pAiThread = new std::thread(&MainWindow::ai_dispatch_thread, this);
-    pTrafficAiThread = new std::thread(&MainWindow::traffic_inference_thread, this);
-    if (plateModelReady && plateHandle) {
-        pPlateAiThread = new std::thread(&MainWindow::plate_inference_thread, this);
-    }
+    pLayer1Model0Thread = new std::thread(&MainWindow::layer1_model_0_inference_thread, this);
+    if (layer1Model1Ready && layer1Model1Handle)
+        pLayer1Model1Thread = new std::thread(&MainWindow::layer1_model_1_inference_thread, this);
+    if (layer1Model2Ready && layer1Model2Handle)
+        pLayer1Model2Thread = new std::thread(&MainWindow::layer1_model_2_inference_thread, this);
     pDisplayThread = new std::thread(&MainWindow::display_thread, this);
 }
 
@@ -981,15 +855,20 @@ void MainWindow::yolo_stop()
         delete pAiThread;
         pAiThread = nullptr;
     }
-    if (pPlateAiThread) {
-        if (pPlateAiThread->joinable()) pPlateAiThread->join();
-        delete pPlateAiThread;
-        pPlateAiThread = nullptr;
+    if (pLayer1Model1Thread) {
+        if (pLayer1Model1Thread->joinable()) pLayer1Model1Thread->join();
+        delete pLayer1Model1Thread;
+        pLayer1Model1Thread = nullptr;
     }
-    if (pTrafficAiThread) {
-        if (pTrafficAiThread->joinable()) pTrafficAiThread->join();
-        delete pTrafficAiThread;
-        pTrafficAiThread = nullptr;
+    if (pLayer1Model2Thread) {
+        if (pLayer1Model2Thread->joinable()) pLayer1Model2Thread->join();
+        delete pLayer1Model2Thread;
+        pLayer1Model2Thread = nullptr;
+    }
+    if (pLayer1Model0Thread) {
+        if (pLayer1Model0Thread->joinable()) pLayer1Model0Thread->join();
+        delete pLayer1Model0Thread;
+        pLayer1Model0Thread = nullptr;
     }
     if (pDisplayThread) {
         if (pDisplayThread->joinable()) pDisplayThread->join();
@@ -1002,9 +881,9 @@ void MainWindow::yolo_stop()
     }
     {
         std::lock_guard<std::mutex> lock(frame_mtx);
-        std::fill(traffic_frames.begin(), traffic_frames.end(), nullptr);
-        std::fill(plate_frames.begin(), plate_frames.end(), nullptr);
-        std::fill(display_frames.begin(), display_frames.end(), nullptr);
+        std::fill(layer1Model0Frames.begin(), layer1Model0Frames.end(), nullptr);
+        std::fill(layer1Model1Frames.begin(), layer1Model1Frames.end(), nullptr);
+        std::fill(layer1Model2Frames.begin(), layer1Model2Frames.end(), nullptr);
     }
 }
 
@@ -1018,8 +897,9 @@ void MainWindow::submitFrame(const std::shared_ptr<SharedFrame>& frame)
         // releases only this queue's shared_ptr; a detector that already took
         // the old frame can finish safely.
         if (ai_running.load()) {
-            traffic_frames[channelId] = frame;
-            if (plateModelReady && plateHandle) plate_frames[channelId] = frame;
+            if (layer1Model0Ready && layer1Model0Handle) layer1Model0Frames[channelId] = frame;
+            if (layer1Model1Ready && layer1Model1Handle) layer1Model1Frames[channelId] = frame;
+            if (layer1Model2Ready && layer1Model2Handle) layer1Model2Frames[channelId] = frame;
         }
     }
     frame_cv.notify_all();
@@ -1040,7 +920,44 @@ std::shared_ptr<SharedFrame> MainWindow::takeLatestFrame(
     return nullptr;
 }
 
-void MainWindow::traffic_inference_thread()
+void MainWindow::recordInferenceTiming(InferenceTimingStats& stats, double elapsedMs)
+{
+    std::lock_guard<std::mutex> lock(stats.mutex);
+    ++stats.sampleCount;
+    stats.totalMs += elapsedMs;
+    stats.minMs = std::min(stats.minMs, elapsedMs);
+    stats.maxMs = std::max(stats.maxMs, elapsedMs);
+}
+
+void MainWindow::printInferenceTimingStats()
+{
+    const auto formatAndReset = [](const char* name, InferenceTimingStats& stats) {
+        std::lock_guard<std::mutex> lock(stats.mutex);
+        QString output;
+        if (stats.sampleCount == 0) {
+            output = QStringLiteral("%1: samples=0").arg(QString::fromLatin1(name));
+        } else {
+            output = QStringLiteral("%1: samples=%2 min_ms=%3 max_ms=%4 avg_ms=%5")
+                         .arg(QString::fromLatin1(name))
+                         .arg(stats.sampleCount)
+                         .arg(stats.minMs, 0, 'f', 3)
+                         .arg(stats.maxMs, 0, 'f', 3)
+                         .arg(stats.totalMs / stats.sampleCount, 0, 'f', 3);
+        }
+        stats.sampleCount = 0;
+        stats.totalMs = 0.0;
+        stats.minMs = std::numeric_limits<double>::infinity();
+        stats.maxMs = 0.0;
+        return output;
+    };
+
+    qInfo().noquote() << QStringLiteral("[QDEEP timing: last 3s]\n%1\n%2\n%3")
+                            .arg(formatAndReset("layer1/model_0", layer1Model0TimingStats))
+                            .arg(formatAndReset("layer1/model_1", layer1Model1TimingStats))
+                            .arg(formatAndReset("layer1/model_2", layer1Model2TimingStats));
+}
+
+void MainWindow::layer1_model_0_inference_thread()
 {
     while (ai_running.load()) {
         std::shared_ptr<SharedFrame> frame;
@@ -1048,11 +965,11 @@ void MainWindow::traffic_inference_thread()
             std::unique_lock<std::mutex> lock(frame_mtx);
             frame_cv.wait(lock, [this] {
                 if (!ai_running.load()) return true;
-                return std::any_of(traffic_frames.begin(), traffic_frames.end(),
+                return std::any_of(layer1Model0Frames.begin(), layer1Model0Frames.end(),
                                    [](const std::shared_ptr<SharedFrame>& frame) { return frame != nullptr; });
             });
             if (!ai_running.load()) break;
-            frame = takeLatestFrame(traffic_frames, traffic_next_channel);
+            frame = takeLatestFrame(layer1Model0Frames, layer1Model0NextChannel);
         }
         if (!frame) continue;
 
@@ -1061,33 +978,35 @@ void MainWindow::traffic_inference_thread()
         ULONG height = frame->height;
         BYTE* buffer = frame->nv12.data();
         ULONG bufferLength = static_cast<ULONG>(frame->nv12.size());
-        QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX* boxList = box_list_vec[frame->channelId];
+        QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX* boxList = layer1Model0BoxLists[frame->channelId];
         ULONG boxSize = BOX_SIZE;
+        QElapsedTimer inferenceTimer;
+        inferenceTimer.start();
         QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
-            trafficHandle, &colorSpace, &width, &height, &buffer, &bufferLength,
+            layer1Model0Handle, &colorSpace, &width, &height, &buffer, &bufferLength,
             &boxList, &boxSize, 1);
+        recordInferenceTiming(layer1Model0TimingStats, inferenceTimer.nsecsElapsed() / 1000000.0);
         if (result != QCAP_RS_SUCCESSFUL) {
-            qWarning() << "[Traffic model] inference failed:" << result
+            qWarning() << "[layer1/model_0] inference failed:" << result
                        << "for native frame" << width << "x" << height;
             continue;
         }
 
         std::lock_guard<std::mutex> lock(draw_mtx);
-        std::vector<DrawBox>& drawList = draw_boxes[frame->channelId];
-        drawList.erase(std::remove_if(drawList.begin(), drawList.end(),
-                                      [](const DrawBox& box) { return !box.isPlate; }), drawList.end());
+        std::vector<DrawBox>& drawList = layer1Model0DrawBoxes[frame->channelId];
+        drawList.clear();
         for (ULONG i = 0; i < boxSize; ++i) {
-            const auto& box = box_list_vec[frame->channelId][i];
-            if (box.fProbability < TRAFFIC_CONFIDENCE) continue;
+            const auto& box = layer1Model0BoxLists[frame->channelId][i];
+            if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
             drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
                                 static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
-                                static_cast<int>(box.nClassID), box.fProbability, false,
-                                QString::fromStdString(trafficClassName(box.nClassID))});
+                                static_cast<int>(box.nClassID), box.fProbability,
+                                QString("model_0 class %1").arg(box.nClassID)});
         }
     }
 }
 
-void MainWindow::plate_inference_thread()
+void MainWindow::layer1_model_1_inference_thread()
 {
     while (ai_running.load()) {
         std::shared_ptr<SharedFrame> frame;
@@ -1095,11 +1014,11 @@ void MainWindow::plate_inference_thread()
             std::unique_lock<std::mutex> lock(frame_mtx);
             frame_cv.wait(lock, [this] {
                 if (!ai_running.load()) return true;
-                return std::any_of(plate_frames.begin(), plate_frames.end(),
+                return std::any_of(layer1Model1Frames.begin(), layer1Model1Frames.end(),
                                    [](const std::shared_ptr<SharedFrame>& frame) { return frame != nullptr; });
             });
             if (!ai_running.load()) break;
-            frame = takeLatestFrame(plate_frames, plate_next_channel);
+            frame = takeLatestFrame(layer1Model1Frames, layer1Model1NextChannel);
         }
         if (!frame) continue;
 
@@ -1108,31 +1027,79 @@ void MainWindow::plate_inference_thread()
         ULONG height = frame->height;
         BYTE* buffer = frame->nv12.data();
         ULONG bufferLength = static_cast<ULONG>(frame->nv12.size());
-        QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX* boxList = plate_box_list_vec[frame->channelId];
+        QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX* boxList = layer1Model1BoxLists[frame->channelId];
         ULONG boxSize = BOX_SIZE;
+        QElapsedTimer inferenceTimer;
+        inferenceTimer.start();
         QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
-            plateHandle, &colorSpace, &width, &height, &buffer, &bufferLength,
+            layer1Model1Handle, &colorSpace, &width, &height, &buffer, &bufferLength,
             &boxList, &boxSize, 1);
+        recordInferenceTiming(layer1Model1TimingStats, inferenceTimer.nsecsElapsed() / 1000000.0);
         if (result != QCAP_RS_SUCCESSFUL) {
-            qWarning() << "[People model] inference failed:" << result
+            qWarning() << "[layer1/model_1] inference failed:" << result
                        << "for native frame" << width << "x" << height;
             continue;
         }
 
         std::lock_guard<std::mutex> lock(draw_mtx);
-        std::vector<DrawBox>& drawList = draw_boxes[frame->channelId];
-        drawList.erase(std::remove_if(drawList.begin(), drawList.end(),
-                                      [](const DrawBox& box) { return box.isPlate; }), drawList.end());
+        std::vector<DrawBox>& drawList = layer1Model1DrawBoxes[frame->channelId];
+        drawList.clear();
         for (ULONG i = 0; i < boxSize; ++i) {
-            const auto& box = plate_box_list_vec[frame->channelId][i];
-            if (box.fProbability < PLATE_CONFIDENCE) continue;
-            const char* feature = reinterpret_cast<const char*>(box.fFeatureVectors);
-            const size_t featureLen = strnlen(feature, QDEEP_MAX_FEATURE_VECTOR_SIZE * sizeof(float));
-            const QString label = featureLen ? QString("LP %1").arg(QString::fromUtf8(feature, static_cast<int>(featureLen)))
-                                             : QStringLiteral("LP");
+            const auto& box = layer1Model1BoxLists[frame->channelId][i];
+            if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
             drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
                                 static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
-                                static_cast<int>(box.nClassID), box.fProbability, true, label});
+                                static_cast<int>(box.nClassID), box.fProbability,
+                                QString("model_1 class %1").arg(box.nClassID)});
+        }
+    }
+}
+
+void MainWindow::layer1_model_2_inference_thread()
+{
+    while (ai_running.load()) {
+        std::shared_ptr<SharedFrame> frame;
+        {
+            std::unique_lock<std::mutex> lock(frame_mtx);
+            frame_cv.wait(lock, [this] {
+                return !ai_running.load() || std::any_of(
+                    layer1Model2Frames.begin(), layer1Model2Frames.end(),
+                    [](const std::shared_ptr<SharedFrame>& value) { return value != nullptr; });
+            });
+            if (!ai_running.load()) break;
+            frame = takeLatestFrame(layer1Model2Frames, layer1Model2NextChannel);
+        }
+        if (!frame) continue;
+
+        ULONG colorSpace = QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12;
+        ULONG width = frame->width;
+        ULONG height = frame->height;
+        BYTE* buffer = frame->nv12.data();
+        ULONG bufferLength = static_cast<ULONG>(frame->nv12.size());
+        QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX* boxList = layer1Model2BoxLists[frame->channelId];
+        ULONG boxSize = BOX_SIZE;
+        QElapsedTimer inferenceTimer;
+        inferenceTimer.start();
+        const QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
+            layer1Model2Handle, &colorSpace, &width, &height, &buffer, &bufferLength,
+            &boxList, &boxSize, 1);
+        recordInferenceTiming(layer1Model2TimingStats, inferenceTimer.nsecsElapsed() / 1000000.0);
+        if (result != QCAP_RS_SUCCESSFUL) {
+            qWarning() << "[layer1/model_2] inference failed:" << result
+                       << "for native frame" << width << "x" << height;
+            continue;
+        }
+
+        std::lock_guard<std::mutex> lock(draw_mtx);
+        std::vector<DrawBox>& drawList = layer1Model2DrawBoxes[frame->channelId];
+        drawList.clear();
+        for (ULONG i = 0; i < boxSize; ++i) {
+            const auto& box = layer1Model2BoxLists[frame->channelId][i];
+            if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
+            drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
+                                static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
+                                static_cast<int>(box.nClassID), box.fProbability,
+                                QString("model_2 class %1").arg(box.nClassID)});
         }
     }
 }
@@ -1154,7 +1121,14 @@ void MainWindow::display_thread()
 void MainWindow::ai_dispatch_thread()
 {
     int nextChannel = 0;
+    auto nextTimingReport = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (ai_running.load()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextTimingReport) {
+            printInferenceTimingStats();
+            nextTimingReport = now + std::chrono::seconds(3);
+        }
+
         std::shared_ptr<SharedFrame> frame;
         for (int offset = 0; offset < MAX_BATCH; ++offset) {
             const int channelId = (nextChannel + offset) % MAX_BATCH;

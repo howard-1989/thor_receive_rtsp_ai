@@ -29,6 +29,8 @@
 #include <thread>
 #include <condition_variable>
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <deque>
 #include <QString>
@@ -42,13 +44,12 @@ namespace QDEEP_API {
 // UI/source-channel storage.  This is deliberately independent from the
 // QDEEP batch allocation below.
 #define MAX_BATCH 9
-// The installed QDEEP licence permits five internal channels.  We create two
-// detectors, so 2 + 2 = 4 slots stays within that limit.
-#define QDEEP_MODEL_BATCH_SIZE 2
+// Each Layer 1 worker submits one frame at a time. Keeping one internal QDEEP
+// slot per model lets model_0, model_1 and model_2 coexist on a five-slot licence.
+#define QDEEP_MODEL_BATCH_SIZE 1
 #define DEFAULT_AI_TARGET_FPS 30.0
 #define AI_QUEUE_MAX_BUFFERS 3
-#define TRAFFIC_CONFIDENCE 0.75f
-#define PLATE_CONFIDENCE 0.50f
+#define LAYER1_MODEL_CONFIDENCE 0.50f
 
 struct DrawBox {
     int x;
@@ -57,12 +58,11 @@ struct DrawBox {
     int height;
     int classId;
     float probability;
-    bool isPlate;
     QString label;
 };
 
 // Owned copy of a decoded client frame.  It is immutable after construction
-// and can therefore be safely shared by display, traffic and people workers.
+// and can therefore be safely shared by display and all three Layer 1 workers.
 struct SharedFrame {
     int channelId;
     ULONG width;
@@ -70,6 +70,17 @@ struct SharedFrame {
     std::vector<BYTE> nv12;
 };
 
+struct InferenceTimingStats {
+    std::mutex mutex;
+    std::uint64_t sampleCount;
+    double totalMs;
+    double minMs;
+    double maxMs;
+
+    InferenceTimingStats()
+        : sampleCount(0), totalMs(0.0),
+          minMs(std::numeric_limits<double>::infinity()), maxMs(0.0) {}
+};
 
 struct ChannelContext {
     int channelId;
@@ -77,7 +88,7 @@ struct ChannelContext {
     QLabel* m_pLabel;
 
     PVOID pClient;
-    // Two independent depth-two/drop-oldest queues.  They own shared CPU
+    // Two independent depth-two/drop-oldest queues. They own shared CPU
     // frames, never QCAP rc-buffers, so queue ownership cannot stall or
     // corrupt the client decoder callback.
     std::deque<std::shared_ptr<SharedFrame>> m_aiFrames;
@@ -160,11 +171,15 @@ public:
     static const int MAX_CHANNELS = 9;
 
 public:
-    void* trafficHandle;
-    void* plateHandle;
-    std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> box_list_vec;
-    std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> plate_box_list_vec;
-    std::vector<DrawBox> draw_boxes[MAX_BATCH];
+    void* layer1Model0Handle;
+    void* layer1Model1Handle;
+    void* layer1Model2Handle;
+    std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> layer1Model0BoxLists;
+    std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> layer1Model1BoxLists;
+    std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> layer1Model2BoxLists;
+    std::vector<DrawBox> layer1Model0DrawBoxes[MAX_BATCH];
+    std::vector<DrawBox> layer1Model1DrawBoxes[MAX_BATCH];
+    std::vector<DrawBox> layer1Model2DrawBoxes[MAX_BATCH];
     std::mutex draw_mtx;
     DWORD flag;
 
@@ -172,25 +187,32 @@ public:
     std::condition_variable cv;
     std::atomic<bool> ai_running;
     std::thread* pAiThread;
-    std::thread* pTrafficAiThread;
-    std::thread* pPlateAiThread;
+    std::thread* pLayer1Model0Thread;
+    std::thread* pLayer1Model1Thread;
+    std::thread* pLayer1Model2Thread;
     std::thread* pDisplayThread;
     int ready_count;
     int active_camera_count;
 
     void submitFrame(const std::shared_ptr<SharedFrame>& frame);
 
-    QString trafficModelPath;
-    QString plateModelPath;
-    bool plateModelReady;
+    QString layer1Model0Path;
+    QString layer1Model1Path;
+    QString layer1Model2Path;
+    bool layer1Model0Ready;
+    bool layer1Model1Ready;
+    bool layer1Model2Ready;
     std::mutex frame_mtx;
     std::condition_variable frame_cv;
-    std::vector<std::shared_ptr<SharedFrame>> traffic_frames;
-    std::vector<std::shared_ptr<SharedFrame>> plate_frames;
-    std::vector<std::shared_ptr<SharedFrame>> display_frames;
-    int traffic_next_channel;
-    int plate_next_channel;
-    int display_next_channel;
+    std::vector<std::shared_ptr<SharedFrame>> layer1Model0Frames;
+    std::vector<std::shared_ptr<SharedFrame>> layer1Model1Frames;
+    std::vector<std::shared_ptr<SharedFrame>> layer1Model2Frames;
+    int layer1Model0NextChannel;
+    int layer1Model1NextChannel;
+    int layer1Model2NextChannel;
+    InferenceTimingStats layer1Model0TimingStats;
+    InferenceTimingStats layer1Model1TimingStats;
+    InferenceTimingStats layer1Model2TimingStats;
 
 
 private:
@@ -202,10 +224,13 @@ private:
     void uninit_models();
     void yolo_start();
     void yolo_stop();
-    void traffic_inference_thread();
-    void plate_inference_thread();
+    void layer1_model_0_inference_thread();
+    void layer1_model_1_inference_thread();
+    void layer1_model_2_inference_thread();
     void display_thread();
     void ai_dispatch_thread();
+    void recordInferenceTiming(InferenceTimingStats& stats, double elapsedMs);
+    void printInferenceTimingStats();
     std::shared_ptr<SharedFrame> takeLatestFrame(std::vector<std::shared_ptr<SharedFrame>>& frames, int& nextChannel);
 
     // UI elements
