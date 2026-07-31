@@ -1,14 +1,24 @@
-# Traffic + plate pipeline
+# Layer 1 model_0 / model_1 / model_2 pipeline
 
-This project displays up to nine RTSP channels in a fixed 3 x 3 grid. A bounded per-channel `qcap2_rcbuffer_queue` holds at most three scaled NV12 frames. When full, the oldest frame is released; the AI thread drains the queue and uses only its latest frame. The same compact batch is then submitted sequentially to the traffic and plate QDEEP handles.
+This demo displays up to nine RTSP channels and runs three independent QDEEP
+Layer 1 workers: `model_0`, `model_1`, and `model_2`. They currently load the
+same Taiwan-traffic model, but have separate handles, queues, workers, result
+buffers, drawing state, and timing statistics. `model_1` and `model_2` can be
+changed later to chained models without changing buffer ownership.
 
-Traffic uses `../model/traffic/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG`.
+## Buffer ownership
 
-Until a genuine QDEEP licence-plate model is available, the second handle defaults to `../model/people/QDEEP.OD.TINY.PERSON.V10N.CFG`, matching the current plate demo. Set `QDEEP_PLATE_MODEL` to replace it with a plate `.CFG` file; the matching weights must be in the location required by that config, for example:
+The QCAP decoded callback buffer is owned by QCAP. The callback only locks it,
+copies it into one application-owned NV12 `SharedFrame`, and unlocks it. It
+never calls `qcap2_rcbuffer_release` on that callback buffer.
 
-```bash
-export QDEEP_PLATE_MODEL=/path/to/QDEEP.OD.LICENSE.PLATE.RECOGNITION.CFG
-./QtQcapMultiClientDemo_traffic_plate_pipeline
-```
+After the copy completes, the display queue and each model queue hold their own
+`std::shared_ptr<SharedFrame>` reference. The per-channel display/input queues
+are depth-two and model queues are depth-one, all drop-oldest; replacing a
+queued frame cannot invalidate a frame currently in
+OpenCV or a synchronous QDEEP call. The QDEEP API receives the `SharedFrame`
+pixels directly and the worker keeps its reference until the API returns.
 
-The repository currently has no plate model asset, so the people model is an intentional temporary default.
+All three default to `/home/nvidia/Documents/new_model/taiwantraffic_batch8/`.
+Override each Layer 1 model without rebuilding with `QDEEP_LAYER1_MODEL_0`,
+`QDEEP_LAYER1_MODEL_1`, and `QDEEP_LAYER1_MODEL_2`.
