@@ -17,13 +17,14 @@
 
 MainWindow *g_pMainwindow = nullptr;
 
-// Layer 1 currently runs the same detector in all three independent workers.
-// Model_1 and model_2 can later be changed to their chained-model inputs
-// without changing queue ownership or worker lifecycle.
+// Layer 1 runs model_0 once for all channels. Layer 2 uses a face-landmark
+// detector per channel after model_0 has completed for that frame.
 static const char* kLayer1Model0 =
-    "/home/nvidia/Documents/new_model/taiwantraffic_batch8/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG";
+    "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/taiwantraffic_batch8/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG";
 static const char* kLayer1Model1 = kLayer1Model0;
 static const char* kLayer1Model2 = kLayer1Model0;
+static const char* kLayer2FaceModel =
+    "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/face/QDEEP.OD.FACE.LANDMARK.5KPS.CFG";
 
 extern "C" {
 QDEEP_EXT_API QRESULT QDEEP_EXPORT QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(PVOID pDetector, ULONG* pCheckNum);
@@ -61,11 +62,13 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
         std::vector<DrawBox> model0Boxes;
         std::vector<DrawBox> model1Boxes;
         std::vector<DrawBox> model2Boxes;
+        std::vector<DrawBox> faceBoxes;
         {
             std::lock_guard<std::mutex> lock(g_pMainwindow->draw_mtx);
             model0Boxes = g_pMainwindow->layer1Model0DrawBoxes[ctx->channelId];
             model1Boxes = g_pMainwindow->layer1Model1DrawBoxes[ctx->channelId];
             model2Boxes = g_pMainwindow->layer1Model2DrawBoxes[ctx->channelId];
+            faceBoxes = g_pMainwindow->layer2FaceDrawBoxes[ctx->channelId];
         }
         cv::putText(bgrMat, "CH " + std::to_string(ctx->channelId + 1), cv::Point(10, 25),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
@@ -78,11 +81,16 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
             cv::rectangle(bgrMat, cv::Rect(x, y, w, h), color, 2);
             cv::putText(bgrMat, box.label.toStdString(), cv::Point(x, std::max(14, y - 4)),
                         cv::FONT_HERSHEY_SIMPLEX, 0.45, color, 2);
+            for (const DrawKeypoint& point : box.keypoints) {
+                if (point.x < 0 || point.y < 0 || point.x >= bgrMat.cols || point.y >= bgrMat.rows) continue;
+                cv::circle(bgrMat, cv::Point(point.x, point.y), 3, color, cv::FILLED, cv::LINE_AA);
+            }
             }
         };
         drawBoxes(model0Boxes, cv::Scalar(0, 255, 0));
-        drawBoxes(model1Boxes, cv::Scalar(255, 128, 0));
-        drawBoxes(model2Boxes, cv::Scalar(0, 255, 255));
+        drawBoxes(model1Boxes, cv::Scalar(0, 255, 255));
+        drawBoxes(model2Boxes, cv::Scalar(255, 0, 255));
+        drawBoxes(faceBoxes, cv::Scalar(255, 128, 0));
     }
 
     const QImage image = cvMatToQImage(bgrMat);
@@ -461,19 +469,20 @@ QRETURN ChannelContext::onDecodedVideoFrame(
 
 // ── MainWindow Implementation ───────────────────────────────────────────────
 MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent), m_bFullscreen(false),
+    : QMainWindow(parent), m_bShowOverlay(true), m_bFullscreen(false),
       // AI init
-      m_bShowOverlay(true), m_bHalfRefreshRate(false),
+      m_bHalfRefreshRate(false),
       layer1Model0Handle(nullptr), layer1Model1Handle(nullptr), layer1Model2Handle(nullptr), flag(1),
       ai_running(false), pAiThread(nullptr), pLayer1Model0Thread(nullptr), pLayer1Model1Thread(nullptr), pLayer1Model2Thread(nullptr), pDisplayThread(nullptr),
       ready_count(0), active_camera_count(0),
       layer1Model0Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_0", QString::fromLatin1(kLayer1Model0))),
       layer1Model1Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_1", QString::fromLatin1(kLayer1Model1))),
       layer1Model2Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_2", QString::fromLatin1(kLayer1Model2))),
+      layer2FaceModelPath(qEnvironmentVariable("QDEEP_LAYER2_FACE_MODEL", QString::fromLatin1(kLayer2FaceModel))),
       layer1Model0Ready(false), layer1Model1Ready(false), layer1Model2Ready(false),
       layer1Model0NextChannel(0), layer1Model1NextChannel(0), layer1Model2NextChannel(0)
 {
-    setWindowTitle("QCAP Multichannel RTSP + Layer 1 model_0 / model_1 / model_2");
+    setWindowTitle("QCAP Multichannel RTSP + Layer 1 model_0 / model_1 / model_2 + Layer 2 face");
     resize(1280, 720);
 
     g_pMainwindow = this;
@@ -549,8 +558,8 @@ MainWindow::MainWindow(QWidget *parent)
     videoGridLayout->setSpacing(2);
     mainLayout->addWidget(videoContainer, 1);
 
-    // Set default URLs
-    onChannelCountChanged(9);
+    // Keep the initial URL rows aligned with the channel-count default.
+    onChannelCountChanged(spinChannelCount->value());
     m_bEnableDisplay = true;
 
     // Signal Slot connections
@@ -590,7 +599,7 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.190.96:554/session0.mpg"));
+            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.190.204:554/session0.mpg"));
         }
     }
 }
@@ -813,6 +822,61 @@ void MainWindow::uninit_models()
     }
 }
 
+void MainWindow::create_layer2_face_workers()
+{
+    destroy_layer2_face_workers();
+    {
+        std::lock_guard<std::mutex> lock(draw_mtx);
+        for (int channelId = 0; channelId < MAX_BATCH; ++channelId)
+            layer2FaceDrawBoxes[channelId].clear();
+    }
+    if (!QFileInfo::exists(layer2FaceModelPath)) {
+        qCritical() << "[layer2/face] model not found:" << layer2FaceModelPath;
+        return;
+    }
+
+    for (ChannelContext* ctx : channels) {
+        if (!ctx || !ctx->pClient) continue;
+        std::unique_ptr<Layer2FaceWorker> worker(new Layer2FaceWorker(ctx->channelId));
+        const QByteArray path = layer2FaceModelPath.toLocal8Bit();
+        const QRESULT createResult = QDEEP_API::QDEEP_CREATE_OBJECT_DETECT(
+            QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+            QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_FACE_LANDMARK_5_KEYPOINTS,
+            const_cast<CHAR*>(path.constData()), &worker->handle, flag);
+        if (createResult != QCAP_RS_SUCCESSFUL || !worker->handle) {
+            qCritical() << "[layer2/face] create failed for CH" << (ctx->channelId + 1)
+                        << "result=" << createResult;
+            continue;
+        }
+        const QRESULT startResult = QDEEP_API::QDEEP_START_OBJECT_DETECT(worker->handle);
+        if (startResult != QCAP_RS_SUCCESSFUL) {
+            qCritical() << "[layer2/face] start failed for CH" << (ctx->channelId + 1)
+                        << "result=" << startResult;
+            QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(worker->handle);
+            worker->handle = nullptr;
+            continue;
+        }
+        worker->ready = true;
+        layer2FaceWorkers.push_back(std::move(worker));
+    }
+}
+
+void MainWindow::destroy_layer2_face_workers()
+{
+    // This function is called only after ai_running is false and every face
+    // thread has been joined, so QDEEP never sees STOP/DESTROY concurrently
+    // with SET_VIDEO on the same handle.
+    for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
+        if (worker->thread.joinable()) worker->thread.join();
+        if (worker->handle) {
+            QDEEP_API::QDEEP_STOP_OBJECT_DETECT(worker->handle);
+            QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(worker->handle);
+            worker->handle = nullptr;
+        }
+    }
+    layer2FaceWorkers.clear();
+}
+
 void MainWindow::yolo_start()
 {
     if (ai_running.load() || !layer1Model0Handle) return;
@@ -820,6 +884,7 @@ void MainWindow::yolo_start()
     active_camera_count = 0;
     for (ChannelContext *ctx : channels) {
         if (ctx->pClient != nullptr) {
+            QMutexLocker lock(&ctx->m_mutex);
             ctx->m_bSendBuffer = true;
             ctx->m_lastProcessTime = 0.0;
             ctx->m_bFrameReady = false;
@@ -832,6 +897,7 @@ void MainWindow::yolo_start()
         return;
     }
 
+    create_layer2_face_workers();
     ai_running.store(true);
     pAiThread = new std::thread(&MainWindow::ai_dispatch_thread, this);
     pLayer1Model0Thread = new std::thread(&MainWindow::layer1_model_0_inference_thread, this);
@@ -839,6 +905,9 @@ void MainWindow::yolo_start()
         pLayer1Model1Thread = new std::thread(&MainWindow::layer1_model_1_inference_thread, this);
     if (layer1Model2Ready && layer1Model2Handle)
         pLayer1Model2Thread = new std::thread(&MainWindow::layer1_model_2_inference_thread, this);
+    for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
+        worker->thread = std::thread(&MainWindow::layer2_face_inference_thread, this, worker.get());
+    }
     pDisplayThread = new std::thread(&MainWindow::display_thread, this);
 }
 
@@ -847,6 +916,9 @@ void MainWindow::yolo_stop()
     ai_running.store(false);
     cv.notify_all();
     frame_cv.notify_all();
+    for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
+        worker->queueCv.notify_all();
+    }
 
     if (pAiThread) {
         if (pAiThread->joinable()) {
@@ -876,7 +948,10 @@ void MainWindow::yolo_stop()
         pDisplayThread = nullptr;
     }
 
+    destroy_layer2_face_workers();
+
     for (ChannelContext *ctx : channels) {
+        QMutexLocker lock(&ctx->m_mutex);
         ctx->m_bSendBuffer = false;
     }
     {
@@ -903,6 +978,23 @@ void MainWindow::submitFrame(const std::shared_ptr<SharedFrame>& frame)
         }
     }
     frame_cv.notify_all();
+}
+
+void MainWindow::submitLayer2FaceFrame(const std::shared_ptr<SharedFrame>& frame)
+{
+    if (!frame || !ai_running.load()) return;
+    for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
+        if (!worker->ready || worker->channelId != frame->channelId) continue;
+        {
+            std::lock_guard<std::mutex> lock(worker->queueMutex);
+            // Depth-one/drop-oldest: model_0 and face inference cannot block
+            // each other, while a face call already in progress retains its
+            // own shared_ptr until it returns.
+            worker->pendingFrame = frame;
+        }
+        worker->queueCv.notify_one();
+        return;
+    }
 }
 
 std::shared_ptr<SharedFrame> MainWindow::takeLatestFrame(
@@ -951,10 +1043,17 @@ void MainWindow::printInferenceTimingStats()
         return output;
     };
 
-    qInfo().noquote() << QStringLiteral("[QDEEP timing: last 3s]\n%1\n%2\n%3")
-                            .arg(formatAndReset("layer1/model_0", layer1Model0TimingStats))
-                            .arg(formatAndReset("layer1/model_1", layer1Model1TimingStats))
-                            .arg(formatAndReset("layer1/model_2", layer1Model2TimingStats));
+    QString output = QStringLiteral("[QDEEP timing: last 3s]\n%1")
+                         .arg(formatAndReset("layer1/model_0", layer1Model0TimingStats));
+    output += QStringLiteral("\n%1\n%2")
+                  .arg(formatAndReset("layer1/model_1", layer1Model1TimingStats))
+                  .arg(formatAndReset("layer1/model_2", layer1Model2TimingStats));
+    for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
+        output += QStringLiteral("\n%1").arg(formatAndReset(
+            QStringLiteral("layer2/face CH%1").arg(worker->channelId + 1).toLocal8Bit().constData(),
+            worker->timing));
+    }
+    qInfo().noquote() << output;
 }
 
 void MainWindow::layer1_model_0_inference_thread()
@@ -992,17 +1091,22 @@ void MainWindow::layer1_model_0_inference_thread()
             continue;
         }
 
-        std::lock_guard<std::mutex> lock(draw_mtx);
-        std::vector<DrawBox>& drawList = layer1Model0DrawBoxes[frame->channelId];
-        drawList.clear();
-        for (ULONG i = 0; i < boxSize; ++i) {
-            const auto& box = layer1Model0BoxLists[frame->channelId][i];
-            if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
-            drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
-                                static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
-                                static_cast<int>(box.nClassID), box.fProbability,
-                                QString("model_0 class %1").arg(box.nClassID)});
+        {
+            std::lock_guard<std::mutex> lock(draw_mtx);
+            std::vector<DrawBox>& drawList = layer1Model0DrawBoxes[frame->channelId];
+            drawList.clear();
+            for (ULONG i = 0; i < boxSize; ++i) {
+                const auto& box = layer1Model0BoxLists[frame->channelId][i];
+                if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
+                drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
+                                    static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
+                                    static_cast<int>(box.nClassID), box.fProbability,
+                                    QString("model_0 class %1").arg(box.nClassID), {}});
+            }
         }
+        // The exact same immutable SharedFrame is handed to the matching
+        // channel's Layer 2 queue only after model_0 finishes successfully.
+        submitLayer2FaceFrame(frame);
     }
 }
 
@@ -1013,9 +1117,9 @@ void MainWindow::layer1_model_1_inference_thread()
         {
             std::unique_lock<std::mutex> lock(frame_mtx);
             frame_cv.wait(lock, [this] {
-                if (!ai_running.load()) return true;
-                return std::any_of(layer1Model1Frames.begin(), layer1Model1Frames.end(),
-                                   [](const std::shared_ptr<SharedFrame>& frame) { return frame != nullptr; });
+                return !ai_running.load() || std::any_of(
+                    layer1Model1Frames.begin(), layer1Model1Frames.end(),
+                    [](const std::shared_ptr<SharedFrame>& value) { return value != nullptr; });
             });
             if (!ai_running.load()) break;
             frame = takeLatestFrame(layer1Model1Frames, layer1Model1NextChannel);
@@ -1023,24 +1127,21 @@ void MainWindow::layer1_model_1_inference_thread()
         if (!frame) continue;
 
         ULONG colorSpace = QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12;
-        ULONG width = frame->width;
-        ULONG height = frame->height;
+        ULONG width = frame->width, height = frame->height;
         BYTE* buffer = frame->nv12.data();
         ULONG bufferLength = static_cast<ULONG>(frame->nv12.size());
         QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX* boxList = layer1Model1BoxLists[frame->channelId];
         ULONG boxSize = BOX_SIZE;
         QElapsedTimer inferenceTimer;
         inferenceTimer.start();
-        QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
+        const QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
             layer1Model1Handle, &colorSpace, &width, &height, &buffer, &bufferLength,
             &boxList, &boxSize, 1);
         recordInferenceTiming(layer1Model1TimingStats, inferenceTimer.nsecsElapsed() / 1000000.0);
         if (result != QCAP_RS_SUCCESSFUL) {
-            qWarning() << "[layer1/model_1] inference failed:" << result
-                       << "for native frame" << width << "x" << height;
+            qWarning() << "[layer1/model_1] inference failed:" << result;
             continue;
         }
-
         std::lock_guard<std::mutex> lock(draw_mtx);
         std::vector<DrawBox>& drawList = layer1Model1DrawBoxes[frame->channelId];
         drawList.clear();
@@ -1050,7 +1151,7 @@ void MainWindow::layer1_model_1_inference_thread()
             drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
                                 static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
                                 static_cast<int>(box.nClassID), box.fProbability,
-                                QString("model_1 class %1").arg(box.nClassID)});
+                                QString("model_1 class %1").arg(box.nClassID), {}});
         }
     }
 }
@@ -1072,8 +1173,7 @@ void MainWindow::layer1_model_2_inference_thread()
         if (!frame) continue;
 
         ULONG colorSpace = QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12;
-        ULONG width = frame->width;
-        ULONG height = frame->height;
+        ULONG width = frame->width, height = frame->height;
         BYTE* buffer = frame->nv12.data();
         ULONG bufferLength = static_cast<ULONG>(frame->nv12.size());
         QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX* boxList = layer1Model2BoxLists[frame->channelId];
@@ -1085,11 +1185,9 @@ void MainWindow::layer1_model_2_inference_thread()
             &boxList, &boxSize, 1);
         recordInferenceTiming(layer1Model2TimingStats, inferenceTimer.nsecsElapsed() / 1000000.0);
         if (result != QCAP_RS_SUCCESSFUL) {
-            qWarning() << "[layer1/model_2] inference failed:" << result
-                       << "for native frame" << width << "x" << height;
+            qWarning() << "[layer1/model_2] inference failed:" << result;
             continue;
         }
-
         std::lock_guard<std::mutex> lock(draw_mtx);
         std::vector<DrawBox>& drawList = layer1Model2DrawBoxes[frame->channelId];
         drawList.clear();
@@ -1099,7 +1197,60 @@ void MainWindow::layer1_model_2_inference_thread()
             drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
                                 static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
                                 static_cast<int>(box.nClassID), box.fProbability,
-                                QString("model_2 class %1").arg(box.nClassID)});
+                                QString("model_2 class %1").arg(box.nClassID), {}});
+        }
+    }
+}
+
+void MainWindow::layer2_face_inference_thread(Layer2FaceWorker* worker)
+{
+    if (!worker || !worker->handle) return;
+    while (ai_running.load()) {
+        std::shared_ptr<SharedFrame> frame;
+        {
+            std::unique_lock<std::mutex> lock(worker->queueMutex);
+            worker->queueCv.wait(lock, [this, worker] {
+                return !ai_running.load() || worker->pendingFrame != nullptr;
+            });
+            if (!ai_running.load()) break;
+            frame = worker->pendingFrame;
+            worker->pendingFrame.reset();
+        }
+        if (!frame) continue;
+
+        std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX> boxes(BOX_SIZE);
+        ULONG boxSize = BOX_SIZE;
+        QElapsedTimer inferenceTimer;
+        inferenceTimer.start();
+        const QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_UNCOMPRESSION_BUFFER(
+            worker->handle, QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12, frame->width, frame->height,
+            frame->nv12.data(), static_cast<ULONG>(frame->nv12.size()), boxes.data(), &boxSize, flag);
+        recordInferenceTiming(worker->timing, inferenceTimer.nsecsElapsed() / 1000000.0);
+        if (result != QCAP_RS_SUCCESSFUL) {
+            qWarning() << "[layer2/face] inference failed for CH" << (worker->channelId + 1)
+                       << "result=" << result;
+            continue;
+        }
+
+        std::vector<DrawBox> drawList;
+        for (ULONG i = 0; i < boxSize; ++i) {
+            const auto& box = boxes[i];
+            if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
+            DrawBox drawBox = {static_cast<int>(box.nX), static_cast<int>(box.nY),
+                               static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
+                               static_cast<int>(box.nClassID), box.fProbability,
+                               QStringLiteral("face %1%").arg(box.fProbability * 100.0f, 0, 'f', 0), {}};
+            for (int keypoint = 0; keypoint < 5; ++keypoint) {
+                const auto& point = box.sKeypoints[keypoint];
+                if (point.fProbability >= 0.05f)
+                    drawBox.keypoints.push_back({static_cast<int>(point.nX),
+                                                 static_cast<int>(point.nY), point.fProbability});
+            }
+            drawList.push_back(std::move(drawBox));
+        }
+        {
+            std::lock_guard<std::mutex> lock(draw_mtx);
+            layer2FaceDrawBoxes[worker->channelId] = std::move(drawList);
         }
     }
 }

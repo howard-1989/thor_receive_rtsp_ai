@@ -44,12 +44,18 @@ namespace QDEEP_API {
 // UI/source-channel storage.  This is deliberately independent from the
 // QDEEP batch allocation below.
 #define MAX_BATCH 9
-// Each Layer 1 worker submits one frame at a time. Keeping one internal QDEEP
-// slot per model lets model_0, model_1 and model_2 coexist on a five-slot licence.
+// model_0 uses the batch API with one frame at a time. Layer 2 uses the
+// non-batch API, with one independent detector per RTSP channel.
 #define QDEEP_MODEL_BATCH_SIZE 1
 #define DEFAULT_AI_TARGET_FPS 30.0
 #define AI_QUEUE_MAX_BUFFERS 3
 #define LAYER1_MODEL_CONFIDENCE 0.50f
+
+struct DrawKeypoint {
+    int x;
+    int y;
+    float probability;
+};
 
 struct DrawBox {
     int x;
@@ -59,10 +65,11 @@ struct DrawBox {
     int classId;
     float probability;
     QString label;
+    std::vector<DrawKeypoint> keypoints;
 };
 
 // Owned copy of a decoded client frame.  It is immutable after construction
-// and can therefore be safely shared by display and all three Layer 1 workers.
+// and can therefore be safely shared by display, model_0, and its Layer 2 child.
 struct SharedFrame {
     int channelId;
     ULONG width;
@@ -80,6 +87,22 @@ struct InferenceTimingStats {
     InferenceTimingStats()
         : sampleCount(0), totalMs(0.0),
           minMs(std::numeric_limits<double>::infinity()), maxMs(0.0) {}
+};
+
+// This object is owned by MainWindow. Each active RTSP channel gets one of
+// these, so QDEEP handles, input queues, threads, and output buffers never
+// cross channel boundaries.
+struct Layer2FaceWorker {
+    explicit Layer2FaceWorker(int id) : channelId(id), handle(nullptr), ready(false) {}
+
+    int channelId;
+    PVOID handle;
+    bool ready;
+    std::thread thread;
+    std::mutex queueMutex;
+    std::condition_variable queueCv;
+    std::shared_ptr<SharedFrame> pendingFrame;
+    InferenceTimingStats timing;
 };
 
 struct ChannelContext {
@@ -161,7 +184,7 @@ private slots:
     void onHalfRefreshRateToggled(bool checked);
 
 public:
-    bool m_bShowOverlay;
+    std::atomic<bool> m_bShowOverlay;
     QVector<QFrame*> videoFrames;
     QVector<ChannelContext*> channels;
     int m_timerId;
@@ -180,6 +203,7 @@ public:
     std::vector<DrawBox> layer1Model0DrawBoxes[MAX_BATCH];
     std::vector<DrawBox> layer1Model1DrawBoxes[MAX_BATCH];
     std::vector<DrawBox> layer1Model2DrawBoxes[MAX_BATCH];
+    std::vector<DrawBox> layer2FaceDrawBoxes[MAX_BATCH];
     std::mutex draw_mtx;
     DWORD flag;
 
@@ -199,6 +223,7 @@ public:
     QString layer1Model0Path;
     QString layer1Model1Path;
     QString layer1Model2Path;
+    QString layer2FaceModelPath;
     bool layer1Model0Ready;
     bool layer1Model1Ready;
     bool layer1Model2Ready;
@@ -213,6 +238,7 @@ public:
     InferenceTimingStats layer1Model0TimingStats;
     InferenceTimingStats layer1Model1TimingStats;
     InferenceTimingStats layer1Model2TimingStats;
+    std::vector<std::unique_ptr<Layer2FaceWorker>> layer2FaceWorkers;
 
 
 private:
@@ -227,8 +253,12 @@ private:
     void layer1_model_0_inference_thread();
     void layer1_model_1_inference_thread();
     void layer1_model_2_inference_thread();
+    void layer2_face_inference_thread(Layer2FaceWorker* worker);
     void display_thread();
     void ai_dispatch_thread();
+    void create_layer2_face_workers();
+    void destroy_layer2_face_workers();
+    void submitLayer2FaceFrame(const std::shared_ptr<SharedFrame>& frame);
     void recordInferenceTiming(InferenceTimingStats& stats, double elapsedMs);
     void printInferenceTimingStats();
     std::shared_ptr<SharedFrame> takeLatestFrame(std::vector<std::shared_ptr<SharedFrame>>& frames, int& nextChannel);
