@@ -43,10 +43,7 @@ namespace QDEEP_API {
 #define BOX_SIZE 100
 // UI/source-channel storage.  This is deliberately independent from the
 // QDEEP batch allocation below.
-#define MAX_BATCH 9
-// model_0 uses the batch API with one frame at a time. Layer 2 uses the
-// non-batch API, with one independent detector per RTSP channel.
-#define QDEEP_MODEL_BATCH_SIZE 1
+#define MAX_BATCH 4
 #define DEFAULT_AI_TARGET_FPS 30.0
 #define AI_QUEUE_MAX_BUFFERS 3
 #define LAYER1_MODEL_CONFIDENCE 0.50f
@@ -117,6 +114,41 @@ struct Layer2PlateWorker {
     std::mutex queueMutex;
     std::condition_variable queueCv;
     std::shared_ptr<SharedFrame> pendingFrame;
+    InferenceTimingStats timing;
+};
+
+// Layer 3 uses one batch slot for every currently active RTSP channel. A
+// coordinator submits a complete round, so every slot must be filled before
+// this worker invokes QDEEP.
+struct Layer3BatchWorker {
+    explicit Layer3BatchWorker(int id) : modelId(id), handle(nullptr), ready(false) {}
+
+    int modelId;
+    PVOID handle;
+    bool ready;
+    std::thread thread;
+    std::mutex queueMutex;
+    std::condition_variable queueCv;
+    std::vector<int> channelIds;
+    std::vector<std::shared_ptr<SharedFrame>> pendingFrames;
+    InferenceTimingStats timing;
+};
+
+// Layer 1 mirrors Layer 3: every model owns one dynamic-size QDEEP batch,
+// with one slot for each RTSP channel that successfully connected for this
+// run. The round coordinator fills every slot with the same generation of
+// RTSP frames before this worker invokes QDEEP.
+struct Layer1BatchWorker {
+    explicit Layer1BatchWorker(int id) : modelId(id), handle(nullptr), ready(false) {}
+
+    int modelId;
+    PVOID handle;
+    bool ready;
+    std::thread thread;
+    std::mutex queueMutex;
+    std::condition_variable queueCv;
+    std::vector<int> channelIds;
+    std::vector<std::shared_ptr<SharedFrame>> pendingFrames;
     InferenceTimingStats timing;
 };
 
@@ -196,10 +228,14 @@ private slots:
     void onChannelCountChanged(int count);
     void onDisplayToggled(bool checked);
     void onOverlayToggled(bool checked);
+    void onFaceModelToggled(bool checked);
+    void onPlateModelToggled(bool checked);
     void onHalfRefreshRateToggled(bool checked);
 
 public:
     std::atomic<bool> m_bShowOverlay;
+    std::atomic<bool> m_bEnableFaceModel;
+    std::atomic<bool> m_bEnablePlateModel;
     QVector<QFrame*> videoFrames;
     QVector<ChannelContext*> channels;
     int m_timerId;
@@ -209,27 +245,24 @@ public:
     static const int MAX_CHANNELS = 9;
 
 public:
-    void* layer1Model0Handle;
-    void* layer1Model1Handle;
-    void* layer1Model2Handle;
-    std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> layer1Model0BoxLists;
-    std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> layer1Model1BoxLists;
-    std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> layer1Model2BoxLists;
     std::vector<DrawBox> layer1Model0DrawBoxes[MAX_BATCH];
     std::vector<DrawBox> layer1Model1DrawBoxes[MAX_BATCH];
     std::vector<DrawBox> layer1Model2DrawBoxes[MAX_BATCH];
     std::vector<DrawBox> layer2FaceDrawBoxes[MAX_BATCH];
     std::vector<DrawBox> layer2PlateDrawBoxes[MAX_BATCH];
+    std::vector<DrawBox> layer3Model0DrawBoxes[MAX_BATCH];
+    std::vector<DrawBox> layer3Model1DrawBoxes[MAX_BATCH];
     std::mutex draw_mtx;
     DWORD flag;
 
     std::mutex mtx;
     std::condition_variable cv;
+    std::mutex round_mtx;
+    std::condition_variable round_cv;
+    int roundExpected;
+    int roundCompleted;
     std::atomic<bool> ai_running;
     std::thread* pAiThread;
-    std::thread* pLayer1Model0Thread;
-    std::thread* pLayer1Model1Thread;
-    std::thread* pLayer1Model2Thread;
     std::thread* pDisplayThread;
     int ready_count;
     int active_camera_count;
@@ -241,22 +274,12 @@ public:
     QString layer1Model2Path;
     QString layer2FaceModelPath;
     QString layer2PlateModelPath;
-    bool layer1Model0Ready;
-    bool layer1Model1Ready;
-    bool layer1Model2Ready;
-    std::mutex frame_mtx;
-    std::condition_variable frame_cv;
-    std::vector<std::shared_ptr<SharedFrame>> layer1Model0Frames;
-    std::vector<std::shared_ptr<SharedFrame>> layer1Model1Frames;
-    std::vector<std::shared_ptr<SharedFrame>> layer1Model2Frames;
-    int layer1Model0NextChannel;
-    int layer1Model1NextChannel;
-    int layer1Model2NextChannel;
-    InferenceTimingStats layer1Model0TimingStats;
-    InferenceTimingStats layer1Model1TimingStats;
-    InferenceTimingStats layer1Model2TimingStats;
+    QString layer3PersonModelPath;
+    std::vector<std::unique_ptr<Layer1BatchWorker>> layer1BatchWorkers;
     std::vector<std::unique_ptr<Layer2FaceWorker>> layer2FaceWorkers;
     std::vector<std::unique_ptr<Layer2PlateWorker>> layer2PlateWorkers;
+    std::vector<std::unique_ptr<Layer3BatchWorker>> layer3BatchWorkers;
+    InferenceTimingStats roundTimingStats;
 
 
 private:
@@ -268,11 +291,10 @@ private:
     void uninit_models();
     void yolo_start();
     void yolo_stop();
-    void layer1_model_0_inference_thread();
-    void layer1_model_1_inference_thread();
-    void layer1_model_2_inference_thread();
+    void layer1_batch_inference_thread(Layer1BatchWorker* worker);
     void layer2_face_inference_thread(Layer2FaceWorker* worker);
     void layer2_plate_inference_thread(Layer2PlateWorker* worker);
+    void layer3_batch_inference_thread(Layer3BatchWorker* worker);
     void display_thread();
     void ai_dispatch_thread();
     void create_layer2_face_workers();
@@ -281,9 +303,17 @@ private:
     void create_layer2_plate_workers();
     void destroy_layer2_plate_workers();
     void submitLayer2PlateFrame(const std::shared_ptr<SharedFrame>& frame);
+    void create_layer3_batch_workers();
+    void destroy_layer3_batch_workers();
+    void submitLayer3Model0Frame(const std::shared_ptr<SharedFrame>& frame);
+    void submitLayer3Model1Frame(const std::shared_ptr<SharedFrame>& frame);
     void recordInferenceTiming(InferenceTimingStats& stats, double elapsedMs);
     void printInferenceTimingStats();
-    std::shared_ptr<SharedFrame> takeLatestFrame(std::vector<std::shared_ptr<SharedFrame>>& frames, int& nextChannel);
+    void create_layer1_batch_workers();
+    void destroy_layer1_batch_workers();
+    void beginRoundStage(int expected);
+    void completeRoundStage();
+    bool waitForRoundStage();
 
     // UI elements
     QWidget *centralWidget;
@@ -297,6 +327,8 @@ private:
     QPushButton *btnStop;
     QCheckBox *chkEnableDisplay;
     QCheckBox *chkShowOverlay;
+    QCheckBox *chkEnableFaceModel;
+    QCheckBox *chkEnablePlateModel;
     QCheckBox *chkHalfRefreshRate;
     QLabel *lblStatus;
 };

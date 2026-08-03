@@ -22,10 +22,14 @@ INCLUDEPATH += \
     ../qdeep/include \
     /usr/include/opencv4
 
-QMAKE_LFLAGS += -Wl,-rpath,$$PWD/../lib \
-                -Wl,-rpath,$$PWD/../qdeep/lib
+# 原本 QDEEP runtime library 路徑：-Wl,-rpath,$$PWD/../qdeep/lib
+# 原本 QDEEP link library 路徑：-L$$PWD/../qdeep/lib -lQDEEP
+# 將 MY 的路徑放在 qcap 所在路徑之前，確保 runtime 先解析到 MY 的 libQDEEP。
+QMAKE_LFLAGS += -Wl,-rpath,/home/nvidia/Downloads/MY/lib \
+                -Wl,-rpath,$$PWD/../lib
 
-LIBS += -L$$PWD/../lib -lqcap -lqcap2_rcbuffer -L$$PWD/../qdeep/lib -lQDEEP
+LIBS += -L$$PWD/../lib -lqcap -lqcap2_rcbuffer \
+        -L/home/nvidia/Downloads/MY/lib -lQDEEP
 
 CONFIG += link_pkgconfig
 PKGCONFIG += opencv4

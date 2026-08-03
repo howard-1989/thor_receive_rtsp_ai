@@ -20,18 +20,25 @@ MainWindow *g_pMainwindow = nullptr;
 // Layer 1 runs model_0 once for all channels. Layer 2 uses a face-landmark
 // detector per channel after model_0 has completed for that frame.
 static const char* kLayer1Model0 =
-    "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/taiwantraffic_batch8/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG";
+     "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/taiwantraffic_batch8/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG";
+    // "/home/nvidia/Downloads/MY/model/people/QDEEP.OD.TINY.PERSON.V10N.CFG";
 static const char* kLayer1Model1 = kLayer1Model0;
 static const char* kLayer1Model2 = kLayer1Model0;
 static const char* kLayer2FaceModel =
-    "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/face/QDEEP.OD.FACE.LANDMARK.5KPS.CFG";
+    // "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/face/QDEEP.OD.FACE.LANDMARK.5KPS.CFG";
+    "/home/nvidia/Downloads/MY/model/face/QDEEP.OD.FACE.LANDMARK.5KPS.CFG";
 static const char* kLayer2PlateModel =
-    "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/lpr_batch8/QDEEP.OD.LICENSE.PLATE.RECOGNITION.LAW.TINY.CFG";
+    // "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/lpr_batch8/QDEEP.OD.LICENSE.PLATE.RECOGNITION.LAW.TINY.CFG";
+    "/home/nvidia/Downloads/MY/model/lpr/QDEEP.OD.LICENSE.PLATE.RECOGNITION.LAW.TINY.CFG";
+static const char* kLayer3PersonModel =
+    // "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/person_batch8/QDEEP.OD.TINY.PERSON.V10N.CFG";
+    "/home/nvidia/Downloads/MY/model/people/QDEEP.OD.TINY.PERSON.V10N.CFG";
 
 extern "C" {
 QDEEP_EXT_API QRESULT QDEEP_EXPORT QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(PVOID pDetector, ULONG* pCheckNum);
 }
 
+// 將 OpenCV 的 BGR 三通道影像複製並轉成可交由 Qt 顯示的 QImage。
 QImage cvMatToQImage(const cv::Mat& mat) {
     if (mat.type() == CV_8UC3) {
         return QImage(mat.data, mat.cols, mat.rows, mat.step, QImage::Format_RGB888).rgbSwapped().copy();
@@ -39,6 +46,7 @@ QImage cvMatToQImage(const cv::Mat& mat) {
     return QImage();
 }
 
+// 從 QDEEP 車牌框的 feature vector 取出以 NUL 結尾的車牌文字。
 static QString plateTextFromFeatureVector(const QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX& box)
 {
     const char* text = reinterpret_cast<const char*>(box.fFeatureVectors);
@@ -51,6 +59,7 @@ static QString plateTextFromFeatureVector(const QDEEP_API::QDEEP_OBJECT_DETECT_B
 // Display is fed from an immutable CPU frame, never from a QCAP rcbuffer.
 // Each QDEEP worker holds a separate shared_ptr reference until its synchronous
 // API call completes, so no consumer can free pixels used by another consumer.
+// 將最新解碼畫面與各層推論框以 OpenCV 疊圖，並排入 Qt UI 執行緒更新。
 static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFrame>& frame)
 {
     if (!ctx || !frame || !ctx->m_pLabel || !ctx->m_pPendingUpdate ||
@@ -75,6 +84,8 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
         std::vector<DrawBox> model2Boxes;
         std::vector<DrawBox> faceBoxes;
         std::vector<DrawBox> plateBoxes;
+        std::vector<DrawBox> layer3Model0Boxes;
+        std::vector<DrawBox> layer3Model1Boxes;
         {
             std::lock_guard<std::mutex> lock(g_pMainwindow->draw_mtx);
             model0Boxes = g_pMainwindow->layer1Model0DrawBoxes[ctx->channelId];
@@ -82,6 +93,8 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
             model2Boxes = g_pMainwindow->layer1Model2DrawBoxes[ctx->channelId];
             faceBoxes = g_pMainwindow->layer2FaceDrawBoxes[ctx->channelId];
             plateBoxes = g_pMainwindow->layer2PlateDrawBoxes[ctx->channelId];
+            layer3Model0Boxes = g_pMainwindow->layer3Model0DrawBoxes[ctx->channelId];
+            layer3Model1Boxes = g_pMainwindow->layer3Model1DrawBoxes[ctx->channelId];
         }
         cv::putText(bgrMat, "CH " + std::to_string(ctx->channelId + 1), cv::Point(10, 25),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
@@ -105,6 +118,8 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
         drawBoxes(model2Boxes, cv::Scalar(255, 0, 255));
         drawBoxes(faceBoxes, cv::Scalar(255, 128, 0));
         drawBoxes(plateBoxes, cv::Scalar(0, 215, 255));
+        drawBoxes(layer3Model0Boxes, cv::Scalar(255, 255, 0));
+        drawBoxes(layer3Model1Boxes, cv::Scalar(128, 255, 128));
     }
 
     const QImage image = cvMatToQImage(bgrMat);
@@ -116,6 +131,7 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
     }, Qt::QueuedConnection);
 }
 
+// 複製 raw NV12 解碼資料成應用程式自行持有、可跨 thread 共用的 frame。
 static std::shared_ptr<SharedFrame> copyRawNV12Frame(
     int channelId, const BYTE* source, ULONG sourceLength, ULONG width, ULONG height)
 {
@@ -133,6 +149,7 @@ static std::shared_ptr<SharedFrame> copyRawNV12Frame(
 // application-owned SharedFrame, and only unlock it. This code never calls
 // release on the callback buffer, so it cannot steal or double-release QCAP's
 // reference.
+// 鎖定 QCAP rcbuffer 後轉拷貝為標準 NV12，並在離開前解鎖 QCAP buffer。
 static std::shared_ptr<SharedFrame> copyQcapFrame(int channelId, qcap2_rcbuffer_t* sourceBuffer)
 {
     if (!sourceBuffer) return nullptr;
@@ -184,6 +201,7 @@ static std::shared_ptr<SharedFrame> copyQcapFrame(int channelId, qcap2_rcbuffer_
 }
 
 // ── Static callback functions delegating to ChannelContext ──────────────────
+// 將 QCAP 連線成功 callback 轉交給對應的 ChannelContext。
 static QRETURN on_connected_callback(
         PVOID  pClient,
         UINT   iSessionNum,
@@ -202,6 +220,7 @@ static QRETURN on_connected_callback(
     return ctx->onConnected(pClient, iSessionNum, nVideoEncoderFormat, nVideoWidth, nVideoHeight, bVideoIsInterleaved, dVideoFrameRate);
 }
 
+// 將 QCAP 解碼完成的影像 callback 轉交給對應的 ChannelContext。
 static QRETURN on_decoder_video_cb(
         PVOID pClient,
         UINT iSessionNum,
@@ -216,6 +235,7 @@ static QRETURN on_decoder_video_cb(
     return ctx->onDecodedVideoFrame(dSampleTime, pFrameBuffer, nFrameBufferLen);
 }
 
+// 將 QCAP 連線/接收失敗 callback 轉交給對應的 ChannelContext。
 static QRETURN on_fail_callback(
         PVOID pClient,
         UINT iSessionNum,
@@ -228,6 +248,7 @@ static QRETURN on_fail_callback(
 }
 
 // ── ChannelContext Implementation ───────────────────────────────────────────
+// 建立單一路 RTSP 的狀態、佇列與畫面更新旗標。
 ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
     : channelId(id), url(streamUrl), m_pLabel(pLabel),
       pClient(nullptr),
@@ -241,10 +262,12 @@ ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
     m_displayFrameCount = 0;
 }
 
+// 解構前確保停止此路 RTSP client 並釋放其 pipeline。
 ChannelContext::~ChannelContext() {
     stop();
 }
 
+// 將最新畫面放入 AI 佇列；佇列滿時丟棄最舊畫面避免解碼端阻塞。
 bool ChannelContext::enqueueAIFrame(const std::shared_ptr<SharedFrame>& frame)
 {
     if (!frame) return false;
@@ -254,6 +277,7 @@ bool ChannelContext::enqueueAIFrame(const std::shared_ptr<SharedFrame>& frame)
     return true;
 }
 
+// 取出 AI 佇列中最新畫面並清空較舊畫面。
 std::shared_ptr<SharedFrame> ChannelContext::takeLatestAIFrame()
 {
     std::lock_guard<std::mutex> queueLocker(m_aiQueueMutex);
@@ -263,6 +287,7 @@ std::shared_ptr<SharedFrame> ChannelContext::takeLatestAIFrame()
     return pLatest;
 }
 
+// 將最新畫面放入顯示佇列；佇列滿時丟棄最舊畫面以維持低延遲。
 bool ChannelContext::enqueueDisplayFrame(const std::shared_ptr<SharedFrame>& frame)
 {
     if (!frame) return false;
@@ -272,6 +297,7 @@ bool ChannelContext::enqueueDisplayFrame(const std::shared_ptr<SharedFrame>& fra
     return true;
 }
 
+// 取出顯示佇列中最新畫面並清空較舊畫面。
 std::shared_ptr<SharedFrame> ChannelContext::takeLatestDisplayFrame()
 {
     std::lock_guard<std::mutex> queueLocker(m_aiQueueMutex);
@@ -281,6 +307,7 @@ std::shared_ptr<SharedFrame> ChannelContext::takeLatestDisplayFrame()
     return pLatest;
 }
 
+// 建立、註冊 callback 並啟動單一路 QCAP RTSP broadcast client。
 bool ChannelContext::start() {
     QMutexLocker locker(&m_mutex);
 
@@ -314,12 +341,14 @@ bool ChannelContext::start() {
     return true;
 }
 
+// 清空此路尚未消費的 AI 與顯示畫面，不操作 QCAP 所有權。
 void ChannelContext::cleanupPipeline() {
     std::lock_guard<std::mutex> queueLocker(m_aiQueueMutex);
     m_aiFrames.clear();
     m_displayFrames.clear();
 }
 
+// 依序停止並銷毀此路 QCAP client，再清除本地 frame 佇列。
 void ChannelContext::stop() {
     PVOID pLocalClient = nullptr;
     {
@@ -350,6 +379,7 @@ void ChannelContext::stop() {
     qDebug() << "========== CH" << channelId << "Stop Sequence Finished ==========";
 }
 
+// 記錄 QCAP 失敗狀態，供 UI 定時顯示該 RTSP 路的錯誤資訊。
 QRETURN ChannelContext::onFail(UINT iSessionNum, QRESULT nErrorStatus, DWORD nErrorCode) {
     Q_UNUSED(iSessionNum);
     QMutexLocker locker(&m_mutex);
@@ -358,11 +388,13 @@ QRETURN ChannelContext::onFail(UINT iSessionNum, QRESULT nErrorStatus, DWORD nEr
     return QCAP_RT_OK;
 }
 
+// 安全地切換此路是否把解碼畫面送入 display 佇列。
 void ChannelContext::setDisplayEnabled(bool enabled) {
     QMutexLocker locker(&m_mutex);
     m_bDisplayEnabled = enabled;
 }
 
+// 保存新連線的影像格式與尺寸；重連時清掉前一次遺留的 frame。
 QRETURN ChannelContext::onConnected(
         PVOID pClient,
         UINT iSessionNum,
@@ -419,6 +451,7 @@ QRETURN ChannelContext::onConnected(
     return QCAP_RT_OK;
 }
 
+// 複製 decoder callback 的畫面，分送到顯示與 AI 佇列，絕不保留 QCAP buffer。
 QRETURN ChannelContext::onDecodedVideoFrame(
     double dSampleTime, BYTE* pFrameBuffer, ULONG nFrameBufferLen)
 {
@@ -482,20 +515,19 @@ QRETURN ChannelContext::onDecodedVideoFrame(
 
 
 // ── MainWindow Implementation ───────────────────────────────────────────────
+// 初始化 UI、預設模型路徑、控制項與 QDEEP 啟動期檢查。
 MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent), m_bShowOverlay(true), m_bFullscreen(false),
+    : QMainWindow(parent), m_bShowOverlay(true), m_bEnableFaceModel(true), m_bEnablePlateModel(true), m_bFullscreen(false),
       // AI init
       m_bHalfRefreshRate(false),
-      layer1Model0Handle(nullptr), layer1Model1Handle(nullptr), layer1Model2Handle(nullptr), flag(0),
-      ai_running(false), pAiThread(nullptr), pLayer1Model0Thread(nullptr), pLayer1Model1Thread(nullptr), pLayer1Model2Thread(nullptr), pDisplayThread(nullptr),
+      flag(0), roundExpected(0), roundCompleted(0), ai_running(false), pAiThread(nullptr), pDisplayThread(nullptr),
       ready_count(0), active_camera_count(0),
       layer1Model0Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_0", QString::fromLatin1(kLayer1Model0))),
       layer1Model1Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_1", QString::fromLatin1(kLayer1Model1))),
       layer1Model2Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_2", QString::fromLatin1(kLayer1Model2))),
       layer2FaceModelPath(qEnvironmentVariable("QDEEP_LAYER2_FACE_MODEL", QString::fromLatin1(kLayer2FaceModel))),
       layer2PlateModelPath(qEnvironmentVariable("QDEEP_LAYER2_PLATE_MODEL", QString::fromLatin1(kLayer2PlateModel))),
-      layer1Model0Ready(false), layer1Model1Ready(false), layer1Model2Ready(false),
-      layer1Model0NextChannel(0), layer1Model1NextChannel(0), layer1Model2NextChannel(0)
+      layer3PersonModelPath(qEnvironmentVariable("QDEEP_LAYER3_PERSON_MODEL", QString::fromLatin1(kLayer3PersonModel)))
 {
     setWindowTitle("QCAP Multichannel RTSP + Layer 1 / Layer 2 face + plate");
     resize(1280, 720);
@@ -503,13 +535,6 @@ MainWindow::MainWindow(QWidget *parent)
     g_pMainwindow = this;
 
     // ── Initialize AI members ────────────────────────────────────────────
-    layer1Model0BoxLists.assign(MAX_BATCH, nullptr);
-    layer1Model1BoxLists.assign(MAX_BATCH, nullptr);
-    layer1Model2BoxLists.assign(MAX_BATCH, nullptr);
-    layer1Model0Frames.assign(MAX_BATCH, nullptr);
-    layer1Model1Frames.assign(MAX_BATCH, nullptr);
-    layer1Model2Frames.assign(MAX_BATCH, nullptr);
-
     centralWidget = new QWidget(this);
     setCentralWidget(centralWidget);
 
@@ -526,9 +551,9 @@ MainWindow::MainWindow(QWidget *parent)
     QGroupBox *grpConfig = new QGroupBox("RTSP Configuration", controlPanel);
     QVBoxLayout *grpLayout = new QVBoxLayout(grpConfig);
 
-    grpLayout->addWidget(new QLabel("Channel Count (1-8):"));
+    grpLayout->addWidget(new QLabel(QString("Channel Count (1-%1):").arg(MAX_BATCH)));
     spinChannelCount = new QSpinBox(grpConfig);
-    spinChannelCount->setRange(1, MAX_CHANNELS);
+    spinChannelCount->setRange(1, MAX_BATCH);
     spinChannelCount->setValue(4);
     grpLayout->addWidget(spinChannelCount);
 
@@ -553,6 +578,14 @@ MainWindow::MainWindow(QWidget *parent)
     chkShowOverlay = new QCheckBox("Show AI Detection Boxes", grpConfig);
     chkShowOverlay->setChecked(true);
     grpLayout->addWidget(chkShowOverlay);
+
+    chkEnableFaceModel = new QCheckBox("Enable FR (Layer 2 Face)", grpConfig);
+    chkEnableFaceModel->setChecked(true);
+    grpLayout->addWidget(chkEnableFaceModel);
+
+    chkEnablePlateModel = new QCheckBox("Enable Plate Recognition (Layer 2 model_1)", grpConfig);
+    chkEnablePlateModel->setChecked(true);
+    grpLayout->addWidget(chkEnablePlateModel);
 
     chkHalfRefreshRate = new QCheckBox("Half Display Refresh Rate", grpConfig);
     chkHalfRefreshRate->setChecked(false);
@@ -583,6 +616,8 @@ MainWindow::MainWindow(QWidget *parent)
     connect(btnStop, &QPushButton::clicked, this, &MainWindow::onBtnStopClicked);
     connect(chkEnableDisplay, &QCheckBox::toggled, this, &MainWindow::onDisplayToggled);
     connect(chkShowOverlay, &QCheckBox::toggled, this, &MainWindow::onOverlayToggled);
+    connect(chkEnableFaceModel, &QCheckBox::toggled, this, &MainWindow::onFaceModelToggled);
+    connect(chkEnablePlateModel, &QCheckBox::toggled, this, &MainWindow::onPlateModelToggled);
     connect(chkHalfRefreshRate, &QCheckBox::toggled, this, &MainWindow::onHalfRefreshRateToggled);
 
     videoContainer->installEventFilter(this);
@@ -593,6 +628,7 @@ MainWindow::MainWindow(QWidget *parent)
     init_models();
 }
 
+// 關閉 AI 與 RTSP 資源，確保所有 worker 都在視窗銷毀前結束。
 MainWindow::~MainWindow()
 {
     uninit_models();
@@ -600,6 +636,7 @@ MainWindow::~MainWindow()
 }
 
 // ── UI Event Handlers ───────────────────────────────────────────────────────
+// 依 UI 路數調整 URL 表格並補上缺少的預設 RTSP URL。
 void MainWindow::onChannelCountChanged(int count)
 {
     tableUrls->setRowCount(count);
@@ -614,11 +651,12 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.190.204:554/session0.mpg"));
+            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.190.128:554/session0.mpg"));
         }
     }
 }
 
+// 建立所有 UI channel 與 RTSP client，鎖定設定後啟動 AI pipeline。
 void MainWindow::onBtnStartClicked()
 {
     stopAllChannels();
@@ -659,6 +697,8 @@ void MainWindow::onBtnStartClicked()
 
     spinChannelCount->setEnabled(false);
     tableUrls->setEnabled(false);
+    chkEnableFaceModel->setEnabled(false);
+    chkEnablePlateModel->setEnabled(false);
     btnStart->setEnabled(false);
     btnStop->setEnabled(true);
     lblStatus->setText("Status: Running");
@@ -667,6 +707,7 @@ void MainWindow::onBtnStartClicked()
     yolo_start();
 }
 
+// 停止 AI、RTSP 與顯示格，並恢復可編輯的啟動設定。
 void MainWindow::onBtnStopClicked()
 {
     yolo_stop();
@@ -676,11 +717,14 @@ void MainWindow::onBtnStopClicked()
 
     spinChannelCount->setEnabled(true);
     tableUrls->setEnabled(true);
+    chkEnableFaceModel->setEnabled(true);
+    chkEnablePlateModel->setEnabled(true);
     btnStart->setEnabled(true);
     btnStop->setEnabled(false);
     lblStatus->setText("Status: Stopped");
 }
 
+// 停止並刪除目前所有 ChannelContext 與其 QCAP client。
 void MainWindow::stopAllChannels()
 {
     for (ChannelContext *ctx : channels) {
@@ -690,6 +734,7 @@ void MainWindow::stopAllChannels()
     channels.clear();
 }
 
+// 移除並延後刪除所有影片顯示格。
 void MainWindow::clearGrid()
 {
     QLayoutItem *item;
@@ -702,6 +747,7 @@ void MainWindow::clearGrid()
     videoFrames.clear();
 }
 
+// 每秒彙整每一路連線狀態與解碼 FPS 後更新狀態列。
 void MainWindow::timerEvent(QTimerEvent *event)
 {
     if (event->timerId() == m_timerId) {
@@ -719,6 +765,7 @@ void MainWindow::timerEvent(QTimerEvent *event)
     }
 }
 
+// 視窗關閉前停止 AI 與所有 RTSP client。
 void MainWindow::closeEvent(QCloseEvent *event)
 {
     yolo_stop();
@@ -726,6 +773,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
     event->accept();
 }
 
+// 處理影片格雙擊；全螢幕時改為每列兩格的四宮格排列。
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
     if (event->type() == QEvent::MouseButtonDblClick) {
@@ -738,10 +786,10 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
             showNormal();
         }
 
-        // Adjust Grid layout
+        // 全螢幕採 2x2 四宮格；回到一般視窗則還原每列三格。
         int count = videoFrames.size();
         if (count > 0) {
-            const int cols = 3; // retain the 3 x 3 grid in fullscreen too
+            const int cols = m_bFullscreen ? 2 : 3;
 
             for (int i = 0; i < count; ++i) {
                 videoGridLayout->removeWidget(videoFrames[i]);
@@ -755,6 +803,7 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
     return QMainWindow::eventFilter(watched, event);
 }
 
+// 將顯示開關同步套用到目前所有 RTSP channel。
 void MainWindow::onDisplayToggled(bool checked)
 {
     m_bEnableDisplay = checked;
@@ -763,80 +812,49 @@ void MainWindow::onDisplayToggled(bool checked)
     }
 }
 
+// 切換 OpenCV 是否在顯示畫面上繪製 AI 推論結果。
 void MainWindow::onOverlayToggled(bool checked)
 {
     m_bShowOverlay = checked;
 }
 
+// 儲存下次啟動時是否建立 Layer2 FR/Face model 的設定。
+void MainWindow::onFaceModelToggled(bool checked)
+{
+    m_bEnableFaceModel.store(checked);
+}
+
+// 儲存下次啟動時是否建立 Layer2 車牌 model 的設定。
+void MainWindow::onPlateModelToggled(bool checked)
+{
+    m_bEnablePlateModel.store(checked);
+}
+
+// 切換顯示更新頻率減半設定。
 void MainWindow::onHalfRefreshRateToggled(bool checked)
 {
     m_bHalfRefreshRate = checked;
 }
 
 // ── QDEEP / YOLO AI Functions ──────────────────────────────────────────────
+// 在 app 啟動期執行原有 QDEEP reserved-status 檢查。
 void MainWindow::init_models()
 {
-    for (int i = 0; i < MAX_BATCH; ++i) {
-        layer1Model0BoxLists[i] = new QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX[BOX_SIZE];
-        layer1Model1BoxLists[i] = new QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX[BOX_SIZE];
-        layer1Model2BoxLists[i] = new QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX[BOX_SIZE];
-    }
-
-    const auto startModel = [this](const char* name, const QString& path, ULONG config, void** handle) {
-        if (!QFileInfo::exists(path)) {
-            qCritical() << "[" << name << "model] not found:" << path;
-            return false;
-        }
-        const QRESULT result = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-            QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0, config, path.toLocal8Bit().data(),
-            handle, flag, QDEEP_MODEL_BATCH_SIZE);
-        if (result != QCAP_RS_SUCCESSFUL || !*handle) {
-            qCritical() << "[" << name << "model] create failed:" << path << "result=" << result;
-            return false;
-        }
-        const QRESULT startResult = QDEEP_API::QDEEP_START_OBJECT_DETECT(*handle);
-        if (startResult != QCAP_RS_SUCCESSFUL) {
-            qCritical() << "[" << name << "model] start failed:" << startResult;
-            QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(*handle);
-            *handle = nullptr;
-            return false;
-        }
-        return true;
-    };
-
-    layer1Model0Ready = startModel("layer1/model_0", layer1Model0Path,
-               QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW, &layer1Model0Handle);
-    layer1Model1Ready = startModel("layer1/model_1", layer1Model1Path,
-               QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW, &layer1Model1Handle);
-    layer1Model2Ready = startModel("layer1/model_2", layer1Model2Path,
-               QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW, &layer1Model2Handle);
+    // Keep this startup call at application initialization. Layer 1 itself is
+    // created at yolo_start(), after the active RTSP channel count is known.
+    const QRESULT reservedResult = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(
+        reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));
+    qDebug() << "[AI Log] QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS res:"
+             << QString("0x%1").arg(reservedResult, 8, 16, QChar('0'));
 }
 
+// 在 app 結束期停止所有 AI worker 與其 QDEEP handle。
 void MainWindow::uninit_models()
 {
     yolo_stop();
-    const auto stopModel = [](void*& handle) {
-        if (!handle) return;
-        QDEEP_API::QDEEP_STOP_OBJECT_DETECT(handle);
-        QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(handle);
-        handle = nullptr;
-    };
-    stopModel(layer1Model0Handle);
-    stopModel(layer1Model1Handle);
-    stopModel(layer1Model2Handle);
-    layer1Model0Ready = false;
-    layer1Model1Ready = false;
-    layer1Model2Ready = false;
-    for (size_t i = 0; i < MAX_BATCH; ++i) {
-        delete[] layer1Model0BoxLists[i];
-        delete[] layer1Model1BoxLists[i];
-        delete[] layer1Model2BoxLists[i];
-        layer1Model0BoxLists[i] = nullptr;
-        layer1Model1BoxLists[i] = nullptr;
-        layer1Model2BoxLists[i] = nullptr;
-    }
 }
 
+// 為每個有效 RTSP channel 建立一個非 batch 的 Layer2 Face/FR worker。
 void MainWindow::create_layer2_face_workers()
 {
     destroy_layer2_face_workers();
@@ -877,6 +895,7 @@ void MainWindow::create_layer2_face_workers()
     }
 }
 
+// 等待所有 Face worker 結束，再停止與銷毀各自的 QDEEP handle。
 void MainWindow::destroy_layer2_face_workers()
 {
     // This function is called only after ai_running is false and every face
@@ -893,6 +912,7 @@ void MainWindow::destroy_layer2_face_workers()
     layer2FaceWorkers.clear();
 }
 
+// 為每個有效 RTSP channel 建立一個非 batch 的 Layer2 車牌 worker。
 void MainWindow::create_layer2_plate_workers()
 {
     destroy_layer2_plate_workers();
@@ -933,6 +953,7 @@ void MainWindow::create_layer2_plate_workers()
     }
 }
 
+// 等待所有車牌 worker 結束，再停止與銷毀各自的 QDEEP handle。
 void MainWindow::destroy_layer2_plate_workers()
 {
     for (const std::unique_ptr<Layer2PlateWorker>& worker : layer2PlateWorkers) {
@@ -946,9 +967,139 @@ void MainWindow::destroy_layer2_plate_workers()
     layer2PlateWorkers.clear();
 }
 
+// 依成功連線路數建立三個 Layer1 動態 batch model worker。
+void MainWindow::create_layer1_batch_workers()
+{
+    destroy_layer1_batch_workers();
+
+    std::vector<int> channelIds;
+    for (ChannelContext* ctx : channels) {
+        if (ctx && ctx->pClient) channelIds.push_back(ctx->channelId);
+    }
+    if (channelIds.empty()) {
+        qWarning() << "[layer1] no active RTSP channels; Layer 1 is disabled for this run.";
+        return;
+    }
+
+    const QString modelPaths[] = {layer1Model0Path, layer1Model1Path, layer1Model2Path};
+    for (int modelId = 0; modelId < 3; ++modelId) {
+        if (!QFileInfo::exists(modelPaths[modelId])) {
+            qCritical() << "[layer1/model_" << modelId << "] model not found:" << modelPaths[modelId];
+            continue;
+        }
+
+        std::unique_ptr<Layer1BatchWorker> worker(new Layer1BatchWorker(modelId));
+        worker->channelIds = channelIds;
+        worker->pendingFrames.assign(channelIds.size(), nullptr);
+        const QByteArray path = modelPaths[modelId].toLocal8Bit();
+        const QRESULT createResult = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
+            QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+            QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
+            const_cast<CHAR*>(path.constData()), &worker->handle, flag,
+            static_cast<ULONG>(channelIds.size()));
+        if (createResult != QCAP_RS_SUCCESSFUL || !worker->handle) {
+            qCritical() << "[layer1/model_" << modelId << "] create failed, result=" << createResult;
+            continue;
+        }
+        const QRESULT startResult = QDEEP_API::QDEEP_START_OBJECT_DETECT(worker->handle);
+        if (startResult != QCAP_RS_SUCCESSFUL) {
+            qCritical() << "[layer1/model_" << modelId << "] start failed, result=" << startResult;
+            QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(worker->handle);
+            worker->handle = nullptr;
+            continue;
+        }
+        worker->ready = true;
+        qInfo() << "[layer1/model_" << modelId << "] started with batch size" << channelIds.size();
+        layer1BatchWorkers.push_back(std::move(worker));
+    }
+}
+
+// 等待 Layer1 batch worker 結束，再安全地停止與銷毀 QDEEP handle。
+void MainWindow::destroy_layer1_batch_workers()
+{
+    for (const std::unique_ptr<Layer1BatchWorker>& worker : layer1BatchWorkers) {
+        if (worker->thread.joinable()) worker->thread.join();
+        if (worker->handle) {
+            QDEEP_API::QDEEP_STOP_OBJECT_DETECT(worker->handle);
+            QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(worker->handle);
+            worker->handle = nullptr;
+        }
+    }
+    layer1BatchWorkers.clear();
+}
+
+// 依成功連線路數建立兩個 Layer3 person 動態 batch model worker。
+void MainWindow::create_layer3_batch_workers()
+{
+    destroy_layer3_batch_workers();
+    std::vector<int> channelIds;
+    for (ChannelContext* ctx : channels) {
+        if (!ctx || !ctx->pClient) continue;
+        channelIds.push_back(ctx->channelId);
+    }
+    if (channelIds.empty()) {
+        qWarning() << "[layer3] no active RTSP channels; Layer 3 is disabled for this run.";
+        return;
+    }
+    if (!QFileInfo::exists(layer3PersonModelPath)) {
+        qCritical() << "[layer3] person model not found:" << layer3PersonModelPath;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(draw_mtx);
+        for (int channelId = 0; channelId < MAX_BATCH; ++channelId) {
+            layer3Model0DrawBoxes[channelId].clear();
+            layer3Model1DrawBoxes[channelId].clear();
+        }
+    }
+
+    for (int modelId = 0; modelId < 2; ++modelId) {
+        std::unique_ptr<Layer3BatchWorker> worker(new Layer3BatchWorker(modelId));
+        worker->channelIds = channelIds;
+        worker->pendingFrames.assign(channelIds.size(), nullptr);
+        const QByteArray path = layer3PersonModelPath.toLocal8Bit();
+        const QRESULT createResult = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
+            QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+            QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
+            const_cast<CHAR*>(path.constData()), &worker->handle, flag,
+            static_cast<ULONG>(channelIds.size()));
+        if (createResult != QCAP_RS_SUCCESSFUL || !worker->handle) {
+            qCritical() << "[layer3/model_" << modelId << "] create failed, result=" << createResult;
+            continue;
+        }
+        const QRESULT startResult = QDEEP_API::QDEEP_START_OBJECT_DETECT(worker->handle);
+        if (startResult != QCAP_RS_SUCCESSFUL) {
+            qCritical() << "[layer3/model_" << modelId << "] start failed, result=" << startResult;
+            QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(worker->handle);
+            worker->handle = nullptr;
+            continue;
+        }
+        worker->ready = true;
+        qInfo() << "[layer3/model_" << modelId << "] started with batch size" << channelIds.size();
+        layer3BatchWorkers.push_back(std::move(worker));
+    }
+}
+
+// 等待 Layer3 batch worker 結束，再停止與銷毀 QDEEP handle。
+void MainWindow::destroy_layer3_batch_workers()
+{
+    // Layer 2 threads are joined before this function, so no more frames can
+    // be queued while a Layer 3 QDEEP handle is being stopped/destroyed.
+    for (const std::unique_ptr<Layer3BatchWorker>& worker : layer3BatchWorkers) {
+        if (worker->thread.joinable()) worker->thread.join();
+        if (worker->handle) {
+            QDEEP_API::QDEEP_STOP_OBJECT_DETECT(worker->handle);
+            QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(worker->handle);
+            worker->handle = nullptr;
+        }
+    }
+    layer3BatchWorkers.clear();
+}
+
+// 建立各層 QDEEP worker，啟動 dispatcher、推論與顯示 thread。
 void MainWindow::yolo_start()
 {
-    if (ai_running.load() || !layer1Model0Handle) return;
+    if (ai_running.load()) return;
 
     active_camera_count = 0;
     for (ChannelContext *ctx : channels) {
@@ -966,33 +1117,53 @@ void MainWindow::yolo_start()
         return;
     }
 
-    create_layer2_face_workers();
-    create_layer2_plate_workers();
+    create_layer1_batch_workers();
+    if (layer1BatchWorkers.empty()) {
+        qCritical() << "[layer1] no model was started; AI pipeline will not run.";
+        return;
+    }
+    if (m_bEnableFaceModel.load()) {
+        create_layer2_face_workers();
+    } else {
+        std::lock_guard<std::mutex> lock(draw_mtx);
+        for (int channelId = 0; channelId < MAX_BATCH; ++channelId)
+            layer2FaceDrawBoxes[channelId].clear();
+    }
+    if (m_bEnablePlateModel.load()) create_layer2_plate_workers();
+    create_layer3_batch_workers();
     ai_running.store(true);
     pAiThread = new std::thread(&MainWindow::ai_dispatch_thread, this);
-    pLayer1Model0Thread = new std::thread(&MainWindow::layer1_model_0_inference_thread, this);
-    if (layer1Model1Ready && layer1Model1Handle)
-        pLayer1Model1Thread = new std::thread(&MainWindow::layer1_model_1_inference_thread, this);
-    if (layer1Model2Ready && layer1Model2Handle)
-        pLayer1Model2Thread = new std::thread(&MainWindow::layer1_model_2_inference_thread, this);
+    for (const std::unique_ptr<Layer1BatchWorker>& worker : layer1BatchWorkers) {
+        worker->thread = std::thread(&MainWindow::layer1_batch_inference_thread, this, worker.get());
+    }
     for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
         worker->thread = std::thread(&MainWindow::layer2_face_inference_thread, this, worker.get());
     }
     for (const std::unique_ptr<Layer2PlateWorker>& worker : layer2PlateWorkers) {
         worker->thread = std::thread(&MainWindow::layer2_plate_inference_thread, this, worker.get());
     }
+    for (const std::unique_ptr<Layer3BatchWorker>& worker : layer3BatchWorkers) {
+        worker->thread = std::thread(&MainWindow::layer3_batch_inference_thread, this, worker.get());
+    }
     pDisplayThread = new std::thread(&MainWindow::display_thread, this);
 }
 
+// 通知、等待並銷毀全部 AI thread 與 QDEEP worker，避免 handle 併發釋放。
 void MainWindow::yolo_stop()
 {
     ai_running.store(false);
     cv.notify_all();
-    frame_cv.notify_all();
+    round_cv.notify_all();
+    for (const std::unique_ptr<Layer1BatchWorker>& worker : layer1BatchWorkers) {
+        worker->queueCv.notify_all();
+    }
     for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
         worker->queueCv.notify_all();
     }
     for (const std::unique_ptr<Layer2PlateWorker>& worker : layer2PlateWorkers) {
+        worker->queueCv.notify_all();
+    }
+    for (const std::unique_ptr<Layer3BatchWorker>& worker : layer3BatchWorkers) {
         worker->queueCv.notify_all();
     }
 
@@ -1003,60 +1174,45 @@ void MainWindow::yolo_stop()
         delete pAiThread;
         pAiThread = nullptr;
     }
-    if (pLayer1Model1Thread) {
-        if (pLayer1Model1Thread->joinable()) pLayer1Model1Thread->join();
-        delete pLayer1Model1Thread;
-        pLayer1Model1Thread = nullptr;
-    }
-    if (pLayer1Model2Thread) {
-        if (pLayer1Model2Thread->joinable()) pLayer1Model2Thread->join();
-        delete pLayer1Model2Thread;
-        pLayer1Model2Thread = nullptr;
-    }
-    if (pLayer1Model0Thread) {
-        if (pLayer1Model0Thread->joinable()) pLayer1Model0Thread->join();
-        delete pLayer1Model0Thread;
-        pLayer1Model0Thread = nullptr;
-    }
     if (pDisplayThread) {
         if (pDisplayThread->joinable()) pDisplayThread->join();
         delete pDisplayThread;
         pDisplayThread = nullptr;
     }
 
+    destroy_layer1_batch_workers();
     destroy_layer2_face_workers();
     destroy_layer2_plate_workers();
+    destroy_layer3_batch_workers();
 
     for (ChannelContext *ctx : channels) {
         QMutexLocker lock(&ctx->m_mutex);
         ctx->m_bSendBuffer = false;
     }
-    {
-        std::lock_guard<std::mutex> lock(frame_mtx);
-        std::fill(layer1Model0Frames.begin(), layer1Model0Frames.end(), nullptr);
-        std::fill(layer1Model1Frames.begin(), layer1Model1Frames.end(), nullptr);
-        std::fill(layer1Model2Frames.begin(), layer1Model2Frames.end(), nullptr);
-    }
 }
 
+// 將同一份解碼 frame 放入三個 Layer1 model 的對應動態 batch slot。
 void MainWindow::submitFrame(const std::shared_ptr<SharedFrame>& frame)
 {
     if (!frame || frame->channelId < 0 || frame->channelId >= MAX_BATCH) return;
-    {
-        std::lock_guard<std::mutex> lock(frame_mtx);
-        const int channelId = frame->channelId;
-        // Each model entry is a depth-one, drop-oldest queue.  Replacing it
-        // releases only this queue's shared_ptr; a detector that already took
-        // the old frame can finish safely.
-        if (ai_running.load()) {
-            if (layer1Model0Ready && layer1Model0Handle) layer1Model0Frames[channelId] = frame;
-            if (layer1Model1Ready && layer1Model1Handle) layer1Model1Frames[channelId] = frame;
-            if (layer1Model2Ready && layer1Model2Handle) layer1Model2Frames[channelId] = frame;
+    if (!ai_running.load()) return;
+    for (const std::unique_ptr<Layer1BatchWorker>& worker : layer1BatchWorkers) {
+        if (!worker->ready) continue;
+        for (size_t slot = 0; slot < worker->channelIds.size(); ++slot) {
+            if (worker->channelIds[slot] != frame->channelId) continue;
+            {
+                std::lock_guard<std::mutex> lock(worker->queueMutex);
+                // One newest frame per channel and model.  The decoder and
+                // downstream Layer 2/3 workers never wait for Layer 1 batch completion.
+                worker->pendingFrames[slot] = frame;
+            }
+            worker->queueCv.notify_one();
+            break;
         }
     }
-    frame_cv.notify_all();
 }
 
+// 將 Layer1 model0 完成的 frame 送給同一路 Layer2 Face worker。
 void MainWindow::submitLayer2FaceFrame(const std::shared_ptr<SharedFrame>& frame)
 {
     if (!frame || !ai_running.load()) return;
@@ -1074,6 +1230,7 @@ void MainWindow::submitLayer2FaceFrame(const std::shared_ptr<SharedFrame>& frame
     }
 }
 
+// 將 Layer1 model1 完成的 frame 送給同一路 Layer2 車牌 worker。
 void MainWindow::submitLayer2PlateFrame(const std::shared_ptr<SharedFrame>& frame)
 {
     if (!frame || !ai_running.load()) return;
@@ -1090,21 +1247,69 @@ void MainWindow::submitLayer2PlateFrame(const std::shared_ptr<SharedFrame>& fram
     }
 }
 
-std::shared_ptr<SharedFrame> MainWindow::takeLatestFrame(
-    std::vector<std::shared_ptr<SharedFrame>>& frames, int& nextChannel)
+// 將 frame 放入指定 Layer3 model 的對應 channel slot，僅保留最新一份。
+static void submitLayer3Frame(
+    const std::vector<std::unique_ptr<Layer3BatchWorker>>& workers,
+    int modelId, const std::shared_ptr<SharedFrame>& frame, const std::atomic<bool>& running)
 {
-    for (int offset = 0; offset < MAX_BATCH; ++offset) {
-        const int channelId = (nextChannel + offset) % MAX_BATCH;
-        if (frames[channelId]) {
-            std::shared_ptr<SharedFrame> frame = frames[channelId];
-            frames[channelId].reset();
-            nextChannel = (channelId + 1) % MAX_BATCH;
-            return frame;
+    if (!frame || !running.load()) return;
+    for (const std::unique_ptr<Layer3BatchWorker>& worker : workers) {
+        if (!worker->ready || worker->modelId != modelId) continue;
+        for (size_t slot = 0; slot < worker->channelIds.size(); ++slot) {
+            if (worker->channelIds[slot] != frame->channelId) continue;
+            {
+                std::lock_guard<std::mutex> lock(worker->queueMutex);
+                // Per-channel depth-one/drop-oldest input. The face/plate
+                // worker never waits for the current-channel batch to complete.
+                worker->pendingFrames[slot] = frame;
+            }
+            worker->queueCv.notify_one();
+            return;
         }
     }
-    return nullptr;
 }
 
+// 將 Face 鏈路（或 FR 關閉時的 Layer1 model0）結果送往 Layer3 model0。
+void MainWindow::submitLayer3Model0Frame(const std::shared_ptr<SharedFrame>& frame)
+{
+    submitLayer3Frame(layer3BatchWorkers, 0, frame, ai_running);
+}
+
+// 將車牌鏈路（或 Plate 關閉時的 Layer1 model1）結果送往 Layer3 model1。
+void MainWindow::submitLayer3Model1Frame(const std::shared_ptr<SharedFrame>& frame)
+{
+    submitLayer3Frame(layer3BatchWorkers, 1, frame, ai_running);
+}
+
+// 設定目前 round 階段要等待的 worker 數；每個被派工的 worker 必須回報一次完成。
+void MainWindow::beginRoundStage(int expected)
+{
+    std::lock_guard<std::mutex> lock(round_mtx);
+    roundExpected = expected;
+    roundCompleted = 0;
+}
+
+// 由已完成 QDEEP 呼叫的 worker 回報，喚醒等待此 round 階段的 coordinator。
+void MainWindow::completeRoundStage()
+{
+    {
+        std::lock_guard<std::mutex> lock(round_mtx);
+        ++roundCompleted;
+    }
+    round_cv.notify_one();
+}
+
+// 等待目前 round 階段所有已派工 worker 完成；停止 AI 時立即離開。
+bool MainWindow::waitForRoundStage()
+{
+    std::unique_lock<std::mutex> lock(round_mtx);
+    round_cv.wait(lock, [this] {
+        return !ai_running.load() || roundCompleted >= roundExpected;
+    });
+    return ai_running.load() && roundCompleted >= roundExpected;
+}
+
+// 以 mutex 累計單次 QDEEP API 呼叫的耗時統計資料。
 void MainWindow::recordInferenceTiming(InferenceTimingStats& stats, double elapsedMs)
 {
     std::lock_guard<std::mutex> lock(stats.mutex);
@@ -1114,6 +1319,7 @@ void MainWindow::recordInferenceTiming(InferenceTimingStats& stats, double elaps
     stats.maxMs = std::max(stats.maxMs, elapsedMs);
 }
 
+// 每三秒輸出並重設所有 Layer1/2/3 model 的推論時間統計與完整 AI round FPS。
 void MainWindow::printInferenceTimingStats()
 {
     const auto formatAndReset = [](const char* name, InferenceTimingStats& stats) {
@@ -1136,14 +1342,44 @@ void MainWindow::printInferenceTimingStats()
         return output;
     };
 
+    const auto formatRoundAndReset = [](InferenceTimingStats& stats) {
+        std::lock_guard<std::mutex> lock(stats.mutex);
+        const std::uint64_t roundCount = stats.sampleCount;
+        QString output;
+        if (roundCount == 0) {
+            output = QStringLiteral("round Layer1->Layer2->Layer3: rounds=0 ai_fps=0.000");
+        } else {
+            output = QStringLiteral("round Layer1->Layer2->Layer3: rounds=%1 ai_fps=%2 min_ms=%3 max_ms=%4 avg_ms=%5")
+                         .arg(roundCount)
+                         .arg(static_cast<double>(roundCount) / 3.0, 0, 'f', 3)
+                         .arg(stats.minMs, 0, 'f', 3)
+                         .arg(stats.maxMs, 0, 'f', 3)
+                         .arg(stats.totalMs / roundCount, 0, 'f', 3);
+        }
+        stats.sampleCount = 0;
+        stats.totalMs = 0.0;
+        stats.minMs = std::numeric_limits<double>::infinity();
+        stats.maxMs = 0.0;
+        return output;
+    };
+
     QString output = QStringLiteral("[QDEEP timing: last 3s]\n%1")
-                         .arg(formatAndReset("layer1/model_0", layer1Model0TimingStats));
-    output += QStringLiteral("\n%1\n%2")
-                  .arg(formatAndReset("layer1/model_1", layer1Model1TimingStats))
-                  .arg(formatAndReset("layer1/model_2", layer1Model2TimingStats));
+        .arg(formatRoundAndReset(roundTimingStats));
+    for (const std::unique_ptr<Layer1BatchWorker>& worker : layer1BatchWorkers) {
+        output += QStringLiteral("\n%1").arg(formatAndReset(
+            QStringLiteral("layer1/model_%1 batch%2").arg(worker->modelId)
+                .arg(worker->channelIds.size()).toLocal8Bit().constData(),
+            worker->timing));
+    }
     for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
         output += QStringLiteral("\n%1").arg(formatAndReset(
             QStringLiteral("layer2/face CH%1").arg(worker->channelId + 1).toLocal8Bit().constData(),
+            worker->timing));
+    }
+    for (const std::unique_ptr<Layer3BatchWorker>& worker : layer3BatchWorkers) {
+        output += QStringLiteral("\n%1").arg(formatAndReset(
+            QStringLiteral("layer3/model_%1 batch%2").arg(worker->modelId)
+                .arg(worker->channelIds.size()).toLocal8Bit().constData(),
             worker->timing));
     }
     for (const std::unique_ptr<Layer2PlateWorker>& worker : layer2PlateWorkers) {
@@ -1154,156 +1390,84 @@ void MainWindow::printInferenceTimingStats()
     qInfo().noquote() << output;
 }
 
-void MainWindow::layer1_model_0_inference_thread()
+// 執行單一 Layer1 model 的完整動態 batch 推論、畫框資料更新與後續鏈路轉送。
+void MainWindow::layer1_batch_inference_thread(Layer1BatchWorker* worker)
 {
+    if (!worker || !worker->handle) return;
     while (ai_running.load()) {
-        std::shared_ptr<SharedFrame> frame;
+        std::vector<std::shared_ptr<SharedFrame>> batchFrames;
         {
-            std::unique_lock<std::mutex> lock(frame_mtx);
-            frame_cv.wait(lock, [this] {
+            std::unique_lock<std::mutex> lock(worker->queueMutex);
+            worker->queueCv.wait(lock, [this, worker] {
                 if (!ai_running.load()) return true;
-                return std::any_of(layer1Model0Frames.begin(), layer1Model0Frames.end(),
+                return std::all_of(worker->pendingFrames.begin(), worker->pendingFrames.end(),
                                    [](const std::shared_ptr<SharedFrame>& frame) { return frame != nullptr; });
             });
             if (!ai_running.load()) break;
-            frame = takeLatestFrame(layer1Model0Frames, layer1Model0NextChannel);
-        }
-        if (!frame) continue;
 
-        ULONG colorSpace = QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12;
-        ULONG width = frame->width;
-        ULONG height = frame->height;
-        BYTE* buffer = frame->nv12.data();
-        ULONG bufferLength = static_cast<ULONG>(frame->nv12.size());
-        QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX* boxList = layer1Model0BoxLists[frame->channelId];
-        ULONG boxSize = BOX_SIZE;
+            batchFrames.resize(worker->channelIds.size());
+            for (size_t slot = 0; slot < worker->channelIds.size(); ++slot) {
+                batchFrames[slot] = worker->pendingFrames[slot];
+                worker->pendingFrames[slot].reset();
+            }
+        }
+
+        const size_t batchSize = worker->channelIds.size();
+        std::vector<ULONG> colorSpaces(batchSize, QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12);
+        std::vector<ULONG> widths(batchSize);
+        std::vector<ULONG> heights(batchSize);
+        std::vector<BYTE*> buffers(batchSize);
+        std::vector<ULONG> bufferLengths(batchSize);
+        std::vector<ULONG> boxSizes(batchSize, BOX_SIZE);
+        std::vector<std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX>> boxStorage(batchSize);
+        std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> boxLists(batchSize);
+        for (size_t slot = 0; slot < batchSize; ++slot) {
+            widths[slot] = batchFrames[slot]->width;
+            heights[slot] = batchFrames[slot]->height;
+            buffers[slot] = batchFrames[slot]->nv12.data();
+            bufferLengths[slot] = static_cast<ULONG>(batchFrames[slot]->nv12.size());
+            boxStorage[slot].resize(BOX_SIZE);
+            boxLists[slot] = boxStorage[slot].data();
+        }
+
         QElapsedTimer inferenceTimer;
         inferenceTimer.start();
-        QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
-            layer1Model0Handle, &colorSpace, &width, &height, &buffer, &bufferLength,
-            &boxList, &boxSize, 1);
-        recordInferenceTiming(layer1Model0TimingStats, inferenceTimer.nsecsElapsed() / 1000000.0);
+        const QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
+            worker->handle, colorSpaces.data(), widths.data(), heights.data(), buffers.data(), bufferLengths.data(),
+            boxLists.data(), boxSizes.data(), static_cast<ULONG>(batchSize));
+        recordInferenceTiming(worker->timing, inferenceTimer.nsecsElapsed() / 1000000.0);
         if (result != QCAP_RS_SUCCESSFUL) {
-            qWarning() << "[layer1/model_0] inference failed:" << result
-                       << "for native frame" << width << "x" << height;
+            qWarning() << "[layer1/model_" << worker->modelId << "] batch inference failed:" << result;
+            completeRoundStage();
             continue;
         }
 
         {
             std::lock_guard<std::mutex> lock(draw_mtx);
-            std::vector<DrawBox>& drawList = layer1Model0DrawBoxes[frame->channelId];
-            drawList.clear();
-            for (ULONG i = 0; i < boxSize; ++i) {
-                const auto& box = layer1Model0BoxLists[frame->channelId][i];
-                if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
-                drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
-                                    static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
-                                    static_cast<int>(box.nClassID), box.fProbability,
-                                    QString("model_0 class %1").arg(box.nClassID), {}});
+            for (size_t slot = 0; slot < batchSize; ++slot) {
+                const int channelId = worker->channelIds[slot];
+                std::vector<DrawBox>* drawList = worker->modelId == 0 ? &layer1Model0DrawBoxes[channelId]
+                    : worker->modelId == 1 ? &layer1Model1DrawBoxes[channelId]
+                                           : &layer1Model2DrawBoxes[channelId];
+                drawList->clear();
+                for (ULONG index = 0; index < boxSizes[slot]; ++index) {
+                    const auto& box = boxStorage[slot][index];
+                    if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
+                    drawList->push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
+                                        static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
+                                        static_cast<int>(box.nClassID), box.fProbability,
+                                        QString("model_%1 class %2").arg(worker->modelId).arg(box.nClassID), {}});
+                }
             }
         }
-        // The exact same immutable SharedFrame is handed to the matching
-        // channel's Layer 2 queue only after model_0 finishes successfully.
-        submitLayer2FaceFrame(frame);
+
+        // The round coordinator waits for all Layer1 workers before it
+        // dispatches this same frame generation to Layer2.
+        completeRoundStage();
     }
 }
 
-void MainWindow::layer1_model_1_inference_thread()
-{
-    while (ai_running.load()) {
-        std::shared_ptr<SharedFrame> frame;
-        {
-            std::unique_lock<std::mutex> lock(frame_mtx);
-            frame_cv.wait(lock, [this] {
-                return !ai_running.load() || std::any_of(
-                    layer1Model1Frames.begin(), layer1Model1Frames.end(),
-                    [](const std::shared_ptr<SharedFrame>& value) { return value != nullptr; });
-            });
-            if (!ai_running.load()) break;
-            frame = takeLatestFrame(layer1Model1Frames, layer1Model1NextChannel);
-        }
-        if (!frame) continue;
-
-        ULONG colorSpace = QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12;
-        ULONG width = frame->width, height = frame->height;
-        BYTE* buffer = frame->nv12.data();
-        ULONG bufferLength = static_cast<ULONG>(frame->nv12.size());
-        QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX* boxList = layer1Model1BoxLists[frame->channelId];
-        ULONG boxSize = BOX_SIZE;
-        QElapsedTimer inferenceTimer;
-        inferenceTimer.start();
-        const QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
-            layer1Model1Handle, &colorSpace, &width, &height, &buffer, &bufferLength,
-            &boxList, &boxSize, 1);
-        recordInferenceTiming(layer1Model1TimingStats, inferenceTimer.nsecsElapsed() / 1000000.0);
-        if (result != QCAP_RS_SUCCESSFUL) {
-            qWarning() << "[layer1/model_1] inference failed:" << result;
-            continue;
-        }
-        {
-            std::lock_guard<std::mutex> lock(draw_mtx);
-            std::vector<DrawBox>& drawList = layer1Model1DrawBoxes[frame->channelId];
-            drawList.clear();
-            for (ULONG i = 0; i < boxSize; ++i) {
-                const auto& box = layer1Model1BoxLists[frame->channelId][i];
-                if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
-                drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
-                                    static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
-                                    static_cast<int>(box.nClassID), box.fProbability,
-                                    QString("model_1 class %1").arg(box.nClassID), {}});
-            }
-        }
-        // Layer2/model_1 starts only after Layer1/model_1 finished this exact frame.
-        submitLayer2PlateFrame(frame);
-    }
-}
-
-void MainWindow::layer1_model_2_inference_thread()
-{
-    while (ai_running.load()) {
-        std::shared_ptr<SharedFrame> frame;
-        {
-            std::unique_lock<std::mutex> lock(frame_mtx);
-            frame_cv.wait(lock, [this] {
-                return !ai_running.load() || std::any_of(
-                    layer1Model2Frames.begin(), layer1Model2Frames.end(),
-                    [](const std::shared_ptr<SharedFrame>& value) { return value != nullptr; });
-            });
-            if (!ai_running.load()) break;
-            frame = takeLatestFrame(layer1Model2Frames, layer1Model2NextChannel);
-        }
-        if (!frame) continue;
-
-        ULONG colorSpace = QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12;
-        ULONG width = frame->width, height = frame->height;
-        BYTE* buffer = frame->nv12.data();
-        ULONG bufferLength = static_cast<ULONG>(frame->nv12.size());
-        QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX* boxList = layer1Model2BoxLists[frame->channelId];
-        ULONG boxSize = BOX_SIZE;
-        QElapsedTimer inferenceTimer;
-        inferenceTimer.start();
-        const QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
-            layer1Model2Handle, &colorSpace, &width, &height, &buffer, &bufferLength,
-            &boxList, &boxSize, 1);
-        recordInferenceTiming(layer1Model2TimingStats, inferenceTimer.nsecsElapsed() / 1000000.0);
-        if (result != QCAP_RS_SUCCESSFUL) {
-            qWarning() << "[layer1/model_2] inference failed:" << result;
-            continue;
-        }
-        std::lock_guard<std::mutex> lock(draw_mtx);
-        std::vector<DrawBox>& drawList = layer1Model2DrawBoxes[frame->channelId];
-        drawList.clear();
-        for (ULONG i = 0; i < boxSize; ++i) {
-            const auto& box = layer1Model2BoxLists[frame->channelId][i];
-            if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
-            drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
-                                static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
-                                static_cast<int>(box.nClassID), box.fProbability,
-                                QString("model_2 class %1").arg(box.nClassID), {}});
-        }
-    }
-}
-
+// 執行單一路 Layer2 Face/FR 推論，保存框與五點結果後轉送 Layer3 model0。
 void MainWindow::layer2_face_inference_thread(Layer2FaceWorker* worker)
 {
     if (!worker || !worker->handle) return;
@@ -1331,6 +1495,7 @@ void MainWindow::layer2_face_inference_thread(Layer2FaceWorker* worker)
         if (result != QCAP_RS_SUCCESSFUL) {
             qWarning() << "[layer2/face] inference failed for CH" << (worker->channelId + 1)
                        << "result=" << result;
+            completeRoundStage();
             continue;
         }
 
@@ -1354,9 +1519,13 @@ void MainWindow::layer2_face_inference_thread(Layer2FaceWorker* worker)
             std::lock_guard<std::mutex> lock(draw_mtx);
             layer2FaceDrawBoxes[worker->channelId] = std::move(drawList);
         }
+        // The round coordinator waits for every Layer2 worker before
+        // dispatching this frame generation to Layer3.
+        completeRoundStage();
     }
 }
 
+// 執行單一路 Layer2 車牌推論，保存車牌文字後轉送 Layer3 model1。
 void MainWindow::layer2_plate_inference_thread(Layer2PlateWorker* worker)
 {
     if (!worker || !worker->handle) return;
@@ -1387,6 +1556,7 @@ void MainWindow::layer2_plate_inference_thread(Layer2PlateWorker* worker)
         if (result != QCAP_RS_SUCCESSFUL) {
             qWarning() << "[layer2/model_1 plate] inference failed for CH" << (worker->channelId + 1)
                        << "result=" << result;
+            completeRoundStage();
             continue;
         }
 
@@ -1406,9 +1576,88 @@ void MainWindow::layer2_plate_inference_thread(Layer2PlateWorker* worker)
             std::lock_guard<std::mutex> lock(draw_mtx);
             layer2PlateDrawBoxes[worker->channelId] = std::move(drawList);
         }
+        // The round coordinator waits for every Layer2 worker before
+        // dispatching this frame generation to Layer3.
+        completeRoundStage();
     }
 }
 
+// 執行單一 Layer3 person model 的完整動態 batch 推論並更新各路繪圖資料。
+void MainWindow::layer3_batch_inference_thread(Layer3BatchWorker* worker)
+{
+    if (!worker || !worker->handle) return;
+    while (ai_running.load()) {
+        std::vector<std::shared_ptr<SharedFrame>> batchFrames;
+        {
+            std::unique_lock<std::mutex> lock(worker->queueMutex);
+            worker->queueCv.wait(lock, [this, worker] {
+                if (!ai_running.load()) return true;
+                return std::all_of(worker->pendingFrames.begin(), worker->pendingFrames.end(),
+                                   [](const std::shared_ptr<SharedFrame>& frame) { return frame != nullptr; });
+            });
+            if (!ai_running.load()) break;
+
+            batchFrames.resize(worker->channelIds.size());
+            for (size_t slot = 0; slot < worker->channelIds.size(); ++slot) {
+                batchFrames[slot] = worker->pendingFrames[slot];
+                worker->pendingFrames[slot].reset();
+            }
+        }
+
+        const size_t batchSize = worker->channelIds.size();
+        std::vector<ULONG> colorSpaces(batchSize);
+        std::vector<ULONG> widths(batchSize);
+        std::vector<ULONG> heights(batchSize);
+        std::vector<BYTE*> buffers(batchSize);
+        std::vector<ULONG> bufferLengths(batchSize);
+        std::vector<ULONG> boxSizes(batchSize, BOX_SIZE);
+        std::vector<std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX>> boxStorage(batchSize);
+        std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> boxLists(batchSize);
+        for (size_t slot = 0; slot < batchSize; ++slot) {
+            colorSpaces[slot] = QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12;
+            widths[slot] = batchFrames[slot]->width;
+            heights[slot] = batchFrames[slot]->height;
+            buffers[slot] = batchFrames[slot]->nv12.data();
+            bufferLengths[slot] = static_cast<ULONG>(batchFrames[slot]->nv12.size());
+            boxStorage[slot].resize(BOX_SIZE);
+            boxLists[slot] = boxStorage[slot].data();
+        }
+
+        QElapsedTimer inferenceTimer;
+        inferenceTimer.start();
+        const QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
+            worker->handle, colorSpaces.data(), widths.data(), heights.data(), buffers.data(), bufferLengths.data(),
+            boxLists.data(), boxSizes.data(), static_cast<ULONG>(batchSize));
+        recordInferenceTiming(worker->timing, inferenceTimer.nsecsElapsed() / 1000000.0);
+        if (result != QCAP_RS_SUCCESSFUL) {
+            qWarning() << "[layer3/model_" << worker->modelId << "] batch inference failed:" << result;
+            completeRoundStage();
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(draw_mtx);
+            for (size_t slot = 0; slot < batchSize; ++slot) {
+                const int channelId = worker->channelIds[slot];
+                std::vector<DrawBox>& drawList = worker->modelId == 0
+                    ? layer3Model0DrawBoxes[channelId] : layer3Model1DrawBoxes[channelId];
+                drawList.clear();
+                for (ULONG index = 0; index < boxSizes[slot]; ++index) {
+                    const auto& box = boxStorage[slot][index];
+                    if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
+                    drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
+                                        static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
+                                        static_cast<int>(box.nClassID), box.fProbability,
+                                        QString("layer3/model_%1 person %2%").arg(worker->modelId)
+                                            .arg(box.fProbability * 100.0f, 0, 'f', 0), {}});
+                }
+            }
+        }
+        completeRoundStage();
+    }
+}
+
+// 持續取每一路最新顯示 frame，交由 OpenCV 疊圖並排入 Qt UI 更新。
 void MainWindow::display_thread()
 {
     while (ai_running.load()) {
@@ -1423,9 +1672,14 @@ void MainWindow::display_thread()
     }
 }
 
+// 以完整多路 frame 組成一個推論 round，依序等待 Layer1、Layer2、Layer3
+// 全部完成後才啟動下一 round；RTSP callback 在等待期間仍持續覆蓋 latest frame。
 void MainWindow::ai_dispatch_thread()
 {
-    int nextChannel = 0;
+    if (layer1BatchWorkers.empty()) return;
+
+    const std::vector<int> channelIds = layer1BatchWorkers.front()->channelIds;
+    std::vector<std::shared_ptr<SharedFrame>> latestInputFrames(channelIds.size());
     auto nextTimingReport = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (ai_running.load()) {
         const auto now = std::chrono::steady_clock::now();
@@ -1434,9 +1688,11 @@ void MainWindow::ai_dispatch_thread()
             nextTimingReport = now + std::chrono::seconds(3);
         }
 
-        std::shared_ptr<SharedFrame> frame;
-        for (int offset = 0; offset < MAX_BATCH; ++offset) {
-            const int channelId = (nextChannel + offset) % MAX_BATCH;
+        // Continuously take only the newest decoded frame from every channel.
+        // If a previous round is busy, the RTSP queues have already collapsed
+        // older frames, so the next round starts from current input.
+        for (size_t slot = 0; slot < channelIds.size(); ++slot) {
+            const int channelId = channelIds[slot];
             ChannelContext* ctx = nullptr;
             for (ChannelContext* channel : channels) {
                 if (channel->channelId == channelId) {
@@ -1445,16 +1701,46 @@ void MainWindow::ai_dispatch_thread()
                 }
             }
             if (!ctx) continue;
-            frame = ctx->takeLatestAIFrame();
-            if (!frame) continue;
-            nextChannel = (channelId + 1) % MAX_BATCH;
-            break;
+            std::shared_ptr<SharedFrame> frame = ctx->takeLatestAIFrame();
+            if (frame) latestInputFrames[slot] = frame;
         }
-        if (frame) {
-            submitFrame(frame);
-        } else {
+
+        const bool roundReady = std::all_of(
+            latestInputFrames.begin(), latestInputFrames.end(),
+            [](const std::shared_ptr<SharedFrame>& frame) { return frame != nullptr; });
+        if (!roundReady) {
             std::unique_lock<std::mutex> lock(mtx);
             cv.wait_for(lock, std::chrono::milliseconds(2), [this] { return !ai_running.load(); });
+            continue;
         }
+
+        // Take one immutable frame per channel for this whole round. New RTSP
+        // frames arriving from now on remain queued for the next round.
+        const std::vector<std::shared_ptr<SharedFrame>> roundFrames = latestInputFrames;
+        std::fill(latestInputFrames.begin(), latestInputFrames.end(), nullptr);
+        QElapsedTimer roundTimer;
+        roundTimer.start();
+
+        // Stage 1: all retained Layer1 models run their dynamic batch in parallel.
+        beginRoundStage(static_cast<int>(layer1BatchWorkers.size()));
+        for (const std::shared_ptr<SharedFrame>& frame : roundFrames) submitFrame(frame);
+        if (!waitForRoundStage()) break;
+
+        // Stage 2: one non-batch Face/Plate job per available channel worker.
+        beginRoundStage(static_cast<int>(layer2FaceWorkers.size() + layer2PlateWorkers.size()));
+        for (const std::shared_ptr<SharedFrame>& frame : roundFrames) {
+            submitLayer2FaceFrame(frame);
+            submitLayer2PlateFrame(frame);
+        }
+        if (!waitForRoundStage()) break;
+
+        // Stage 3: both person batch models consume the same completed round.
+        beginRoundStage(static_cast<int>(layer3BatchWorkers.size()));
+        for (const std::shared_ptr<SharedFrame>& frame : roundFrames) {
+            submitLayer3Model0Frame(frame);
+            submitLayer3Model1Frame(frame);
+        }
+        if (!waitForRoundStage()) break;
+        recordInferenceTiming(roundTimingStats, roundTimer.nsecsElapsed() / 1000000.0);
     }
 }
