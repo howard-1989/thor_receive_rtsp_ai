@@ -105,6 +105,21 @@ struct Layer2FaceWorker {
     InferenceTimingStats timing;
 };
 
+// Layer 2 model_1 is chained from Layer 1 model_1. Like the face layer, every
+// RTSP channel owns its own handle, queue, output buffer, and thread.
+struct Layer2PlateWorker {
+    explicit Layer2PlateWorker(int id) : channelId(id), handle(nullptr), ready(false) {}
+
+    int channelId;
+    PVOID handle;
+    bool ready;
+    std::thread thread;
+    std::mutex queueMutex;
+    std::condition_variable queueCv;
+    std::shared_ptr<SharedFrame> pendingFrame;
+    InferenceTimingStats timing;
+};
+
 struct ChannelContext {
     int channelId;
     QString url;
@@ -204,6 +219,7 @@ public:
     std::vector<DrawBox> layer1Model1DrawBoxes[MAX_BATCH];
     std::vector<DrawBox> layer1Model2DrawBoxes[MAX_BATCH];
     std::vector<DrawBox> layer2FaceDrawBoxes[MAX_BATCH];
+    std::vector<DrawBox> layer2PlateDrawBoxes[MAX_BATCH];
     std::mutex draw_mtx;
     DWORD flag;
 
@@ -224,6 +240,7 @@ public:
     QString layer1Model1Path;
     QString layer1Model2Path;
     QString layer2FaceModelPath;
+    QString layer2PlateModelPath;
     bool layer1Model0Ready;
     bool layer1Model1Ready;
     bool layer1Model2Ready;
@@ -239,6 +256,7 @@ public:
     InferenceTimingStats layer1Model1TimingStats;
     InferenceTimingStats layer1Model2TimingStats;
     std::vector<std::unique_ptr<Layer2FaceWorker>> layer2FaceWorkers;
+    std::vector<std::unique_ptr<Layer2PlateWorker>> layer2PlateWorkers;
 
 
 private:
@@ -254,11 +272,15 @@ private:
     void layer1_model_1_inference_thread();
     void layer1_model_2_inference_thread();
     void layer2_face_inference_thread(Layer2FaceWorker* worker);
+    void layer2_plate_inference_thread(Layer2PlateWorker* worker);
     void display_thread();
     void ai_dispatch_thread();
     void create_layer2_face_workers();
     void destroy_layer2_face_workers();
     void submitLayer2FaceFrame(const std::shared_ptr<SharedFrame>& frame);
+    void create_layer2_plate_workers();
+    void destroy_layer2_plate_workers();
+    void submitLayer2PlateFrame(const std::shared_ptr<SharedFrame>& frame);
     void recordInferenceTiming(InferenceTimingStats& stats, double elapsedMs);
     void printInferenceTimingStats();
     std::shared_ptr<SharedFrame> takeLatestFrame(std::vector<std::shared_ptr<SharedFrame>>& frames, int& nextChannel);

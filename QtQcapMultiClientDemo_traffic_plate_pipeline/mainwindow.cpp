@@ -25,6 +25,8 @@ static const char* kLayer1Model1 = kLayer1Model0;
 static const char* kLayer1Model2 = kLayer1Model0;
 static const char* kLayer2FaceModel =
     "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/face/QDEEP.OD.FACE.LANDMARK.5KPS.CFG";
+static const char* kLayer2PlateModel =
+    "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/lpr_batch8/QDEEP.OD.LICENSE.PLATE.RECOGNITION.LAW.TINY.CFG";
 
 extern "C" {
 QDEEP_EXT_API QRESULT QDEEP_EXPORT QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(PVOID pDetector, ULONG* pCheckNum);
@@ -35,6 +37,15 @@ QImage cvMatToQImage(const cv::Mat& mat) {
         return QImage(mat.data, mat.cols, mat.rows, mat.step, QImage::Format_RGB888).rgbSwapped().copy();
     }
     return QImage();
+}
+
+static QString plateTextFromFeatureVector(const QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX& box)
+{
+    const char* text = reinterpret_cast<const char*>(box.fFeatureVectors);
+    const size_t capacity = QDEEP_MAX_FEATURE_VECTOR_SIZE * sizeof(float);
+    size_t length = 0;
+    while (length < capacity && text[length] != '\0') ++length;
+    return QString::fromUtf8(text, static_cast<int>(length)).trimmed();
 }
 
 // Display is fed from an immutable CPU frame, never from a QCAP rcbuffer.
@@ -63,12 +74,14 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
         std::vector<DrawBox> model1Boxes;
         std::vector<DrawBox> model2Boxes;
         std::vector<DrawBox> faceBoxes;
+        std::vector<DrawBox> plateBoxes;
         {
             std::lock_guard<std::mutex> lock(g_pMainwindow->draw_mtx);
             model0Boxes = g_pMainwindow->layer1Model0DrawBoxes[ctx->channelId];
             model1Boxes = g_pMainwindow->layer1Model1DrawBoxes[ctx->channelId];
             model2Boxes = g_pMainwindow->layer1Model2DrawBoxes[ctx->channelId];
             faceBoxes = g_pMainwindow->layer2FaceDrawBoxes[ctx->channelId];
+            plateBoxes = g_pMainwindow->layer2PlateDrawBoxes[ctx->channelId];
         }
         cv::putText(bgrMat, "CH " + std::to_string(ctx->channelId + 1), cv::Point(10, 25),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
@@ -91,6 +104,7 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
         drawBoxes(model1Boxes, cv::Scalar(0, 255, 255));
         drawBoxes(model2Boxes, cv::Scalar(255, 0, 255));
         drawBoxes(faceBoxes, cv::Scalar(255, 128, 0));
+        drawBoxes(plateBoxes, cv::Scalar(0, 215, 255));
     }
 
     const QImage image = cvMatToQImage(bgrMat);
@@ -472,17 +486,18 @@ MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), m_bShowOverlay(true), m_bFullscreen(false),
       // AI init
       m_bHalfRefreshRate(false),
-      layer1Model0Handle(nullptr), layer1Model1Handle(nullptr), layer1Model2Handle(nullptr), flag(1),
+      layer1Model0Handle(nullptr), layer1Model1Handle(nullptr), layer1Model2Handle(nullptr), flag(0),
       ai_running(false), pAiThread(nullptr), pLayer1Model0Thread(nullptr), pLayer1Model1Thread(nullptr), pLayer1Model2Thread(nullptr), pDisplayThread(nullptr),
       ready_count(0), active_camera_count(0),
       layer1Model0Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_0", QString::fromLatin1(kLayer1Model0))),
       layer1Model1Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_1", QString::fromLatin1(kLayer1Model1))),
       layer1Model2Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_2", QString::fromLatin1(kLayer1Model2))),
       layer2FaceModelPath(qEnvironmentVariable("QDEEP_LAYER2_FACE_MODEL", QString::fromLatin1(kLayer2FaceModel))),
+      layer2PlateModelPath(qEnvironmentVariable("QDEEP_LAYER2_PLATE_MODEL", QString::fromLatin1(kLayer2PlateModel))),
       layer1Model0Ready(false), layer1Model1Ready(false), layer1Model2Ready(false),
       layer1Model0NextChannel(0), layer1Model1NextChannel(0), layer1Model2NextChannel(0)
 {
-    setWindowTitle("QCAP Multichannel RTSP + Layer 1 model_0 / model_1 / model_2 + Layer 2 face");
+    setWindowTitle("QCAP Multichannel RTSP + Layer 1 / Layer 2 face + plate");
     resize(1280, 720);
 
     g_pMainwindow = this;
@@ -838,11 +853,12 @@ void MainWindow::create_layer2_face_workers()
     for (ChannelContext* ctx : channels) {
         if (!ctx || !ctx->pClient) continue;
         std::unique_ptr<Layer2FaceWorker> worker(new Layer2FaceWorker(ctx->channelId));
+        const DWORD faceFlags = QDEEP_API::QDEEP_OBJECT_DETECT_FLAG_FEATURE_VECTOR;
         const QByteArray path = layer2FaceModelPath.toLocal8Bit();
         const QRESULT createResult = QDEEP_API::QDEEP_CREATE_OBJECT_DETECT(
             QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
             QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_FACE_LANDMARK_5_KEYPOINTS,
-            const_cast<CHAR*>(path.constData()), &worker->handle, flag);
+            const_cast<CHAR*>(path.constData()), &worker->handle, faceFlags);
         if (createResult != QCAP_RS_SUCCESSFUL || !worker->handle) {
             qCritical() << "[layer2/face] create failed for CH" << (ctx->channelId + 1)
                         << "result=" << createResult;
@@ -877,6 +893,59 @@ void MainWindow::destroy_layer2_face_workers()
     layer2FaceWorkers.clear();
 }
 
+void MainWindow::create_layer2_plate_workers()
+{
+    destroy_layer2_plate_workers();
+    {
+        std::lock_guard<std::mutex> lock(draw_mtx);
+        for (int channelId = 0; channelId < MAX_BATCH; ++channelId)
+            layer2PlateDrawBoxes[channelId].clear();
+    }
+    if (!QFileInfo::exists(layer2PlateModelPath)) {
+        qCritical() << "[layer2/model_1 plate] model not found:" << layer2PlateModelPath;
+        return;
+    }
+
+    for (ChannelContext* ctx : channels) {
+        if (!ctx || !ctx->pClient) continue;
+        std::unique_ptr<Layer2PlateWorker> worker(new Layer2PlateWorker(ctx->channelId));
+        const QByteArray path = layer2PlateModelPath.toLocal8Bit();
+        const DWORD plateFlags = QDEEP_API::QDEEP_OBJECT_DETECT_FLAG_FEATURE_VECTOR;
+        const QRESULT createResult = QDEEP_API::QDEEP_CREATE_OBJECT_DETECT(
+            QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+            QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_LICENSE_PLATE_RECOGNITION_LAW_ENFORCEMENT,
+            const_cast<CHAR*>(path.constData()), &worker->handle, plateFlags);
+        if (createResult != QCAP_RS_SUCCESSFUL || !worker->handle) {
+            qCritical() << "[layer2/model_1 plate] create failed for CH" << (ctx->channelId + 1)
+                        << "result=" << createResult;
+            continue;
+        }
+        const QRESULT startResult = QDEEP_API::QDEEP_START_OBJECT_DETECT(worker->handle);
+        if (startResult != QCAP_RS_SUCCESSFUL) {
+            qCritical() << "[layer2/model_1 plate] start failed for CH" << (ctx->channelId + 1)
+                        << "result=" << startResult;
+            QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(worker->handle);
+            worker->handle = nullptr;
+            continue;
+        }
+        worker->ready = true;
+        layer2PlateWorkers.push_back(std::move(worker));
+    }
+}
+
+void MainWindow::destroy_layer2_plate_workers()
+{
+    for (const std::unique_ptr<Layer2PlateWorker>& worker : layer2PlateWorkers) {
+        if (worker->thread.joinable()) worker->thread.join();
+        if (worker->handle) {
+            QDEEP_API::QDEEP_STOP_OBJECT_DETECT(worker->handle);
+            QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(worker->handle);
+            worker->handle = nullptr;
+        }
+    }
+    layer2PlateWorkers.clear();
+}
+
 void MainWindow::yolo_start()
 {
     if (ai_running.load() || !layer1Model0Handle) return;
@@ -898,6 +967,7 @@ void MainWindow::yolo_start()
     }
 
     create_layer2_face_workers();
+    create_layer2_plate_workers();
     ai_running.store(true);
     pAiThread = new std::thread(&MainWindow::ai_dispatch_thread, this);
     pLayer1Model0Thread = new std::thread(&MainWindow::layer1_model_0_inference_thread, this);
@@ -908,6 +978,9 @@ void MainWindow::yolo_start()
     for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
         worker->thread = std::thread(&MainWindow::layer2_face_inference_thread, this, worker.get());
     }
+    for (const std::unique_ptr<Layer2PlateWorker>& worker : layer2PlateWorkers) {
+        worker->thread = std::thread(&MainWindow::layer2_plate_inference_thread, this, worker.get());
+    }
     pDisplayThread = new std::thread(&MainWindow::display_thread, this);
 }
 
@@ -917,6 +990,9 @@ void MainWindow::yolo_stop()
     cv.notify_all();
     frame_cv.notify_all();
     for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
+        worker->queueCv.notify_all();
+    }
+    for (const std::unique_ptr<Layer2PlateWorker>& worker : layer2PlateWorkers) {
         worker->queueCv.notify_all();
     }
 
@@ -949,6 +1025,7 @@ void MainWindow::yolo_stop()
     }
 
     destroy_layer2_face_workers();
+    destroy_layer2_plate_workers();
 
     for (ChannelContext *ctx : channels) {
         QMutexLocker lock(&ctx->m_mutex);
@@ -990,6 +1067,22 @@ void MainWindow::submitLayer2FaceFrame(const std::shared_ptr<SharedFrame>& frame
             // Depth-one/drop-oldest: model_0 and face inference cannot block
             // each other, while a face call already in progress retains its
             // own shared_ptr until it returns.
+            worker->pendingFrame = frame;
+        }
+        worker->queueCv.notify_one();
+        return;
+    }
+}
+
+void MainWindow::submitLayer2PlateFrame(const std::shared_ptr<SharedFrame>& frame)
+{
+    if (!frame || !ai_running.load()) return;
+    for (const std::unique_ptr<Layer2PlateWorker>& worker : layer2PlateWorkers) {
+        if (!worker->ready || worker->channelId != frame->channelId) continue;
+        {
+            std::lock_guard<std::mutex> lock(worker->queueMutex);
+            // Depth-one/drop-oldest prevents a plate inference on this stream
+            // from blocking layer1/model_1 or any other RTSP stream.
             worker->pendingFrame = frame;
         }
         worker->queueCv.notify_one();
@@ -1051,6 +1144,11 @@ void MainWindow::printInferenceTimingStats()
     for (const std::unique_ptr<Layer2FaceWorker>& worker : layer2FaceWorkers) {
         output += QStringLiteral("\n%1").arg(formatAndReset(
             QStringLiteral("layer2/face CH%1").arg(worker->channelId + 1).toLocal8Bit().constData(),
+            worker->timing));
+    }
+    for (const std::unique_ptr<Layer2PlateWorker>& worker : layer2PlateWorkers) {
+        output += QStringLiteral("\n%1").arg(formatAndReset(
+            QStringLiteral("layer2/model_1 plate CH%1").arg(worker->channelId + 1).toLocal8Bit().constData(),
             worker->timing));
     }
     qInfo().noquote() << output;
@@ -1142,17 +1240,21 @@ void MainWindow::layer1_model_1_inference_thread()
             qWarning() << "[layer1/model_1] inference failed:" << result;
             continue;
         }
-        std::lock_guard<std::mutex> lock(draw_mtx);
-        std::vector<DrawBox>& drawList = layer1Model1DrawBoxes[frame->channelId];
-        drawList.clear();
-        for (ULONG i = 0; i < boxSize; ++i) {
-            const auto& box = layer1Model1BoxLists[frame->channelId][i];
-            if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
-            drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
-                                static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
-                                static_cast<int>(box.nClassID), box.fProbability,
-                                QString("model_1 class %1").arg(box.nClassID), {}});
+        {
+            std::lock_guard<std::mutex> lock(draw_mtx);
+            std::vector<DrawBox>& drawList = layer1Model1DrawBoxes[frame->channelId];
+            drawList.clear();
+            for (ULONG i = 0; i < boxSize; ++i) {
+                const auto& box = layer1Model1BoxLists[frame->channelId][i];
+                if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
+                drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
+                                    static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
+                                    static_cast<int>(box.nClassID), box.fProbability,
+                                    QString("model_1 class %1").arg(box.nClassID), {}});
+            }
         }
+        // Layer2/model_1 starts only after Layer1/model_1 finished this exact frame.
+        submitLayer2PlateFrame(frame);
     }
 }
 
@@ -1251,6 +1353,58 @@ void MainWindow::layer2_face_inference_thread(Layer2FaceWorker* worker)
         {
             std::lock_guard<std::mutex> lock(draw_mtx);
             layer2FaceDrawBoxes[worker->channelId] = std::move(drawList);
+        }
+    }
+}
+
+void MainWindow::layer2_plate_inference_thread(Layer2PlateWorker* worker)
+{
+    if (!worker || !worker->handle) return;
+    const DWORD plateFlags = QDEEP_API::QDEEP_OBJECT_DETECT_FLAG_FEATURE_VECTOR;
+    while (ai_running.load()) {
+        std::shared_ptr<SharedFrame> frame;
+        {
+            std::unique_lock<std::mutex> lock(worker->queueMutex);
+            worker->queueCv.wait(lock, [this, worker] {
+                return !ai_running.load() || worker->pendingFrame != nullptr;
+            });
+            if (!ai_running.load()) break;
+            frame = worker->pendingFrame;
+            worker->pendingFrame.reset();
+        }
+        if (!frame) continue;
+
+        // This buffer is local to this worker invocation; no other channel or
+        // thread can read/write the returned plate-recognition data.
+        std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX> boxes(BOX_SIZE);
+        ULONG boxSize = BOX_SIZE;
+        QElapsedTimer inferenceTimer;
+        inferenceTimer.start();
+        const QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_UNCOMPRESSION_BUFFER(
+            worker->handle, QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12, frame->width, frame->height,
+            frame->nv12.data(), static_cast<ULONG>(frame->nv12.size()), boxes.data(), &boxSize, plateFlags);
+        recordInferenceTiming(worker->timing, inferenceTimer.nsecsElapsed() / 1000000.0);
+        if (result != QCAP_RS_SUCCESSFUL) {
+            qWarning() << "[layer2/model_1 plate] inference failed for CH" << (worker->channelId + 1)
+                       << "result=" << result;
+            continue;
+        }
+
+        std::vector<DrawBox> drawList;
+        for (ULONG i = 0; i < boxSize; ++i) {
+            const auto& box = boxes[i];
+            if (box.fProbability < LAYER1_MODEL_CONFIDENCE) continue;
+            const QString plateText = plateTextFromFeatureVector(box);
+            const QString label = plateText.isEmpty()
+                ? QStringLiteral("plate %1%").arg(box.fProbability * 100.0f, 0, 'f', 0)
+                : QStringLiteral("plate: %1").arg(plateText);
+            drawList.push_back({static_cast<int>(box.nX), static_cast<int>(box.nY),
+                                static_cast<int>(box.nWidth), static_cast<int>(box.nHeight),
+                                static_cast<int>(box.nClassID), box.fProbability, label, {}});
+        }
+        {
+            std::lock_guard<std::mutex> lock(draw_mtx);
+            layer2PlateDrawBoxes[worker->channelId] = std::move(drawList);
         }
     }
 }
