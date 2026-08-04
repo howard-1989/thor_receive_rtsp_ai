@@ -14,6 +14,7 @@
 #include <opencv2/opencv.hpp>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 
 MainWindow *g_pMainwindow = nullptr;
 
@@ -98,18 +99,24 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
         }
         cv::putText(bgrMat, "CH " + std::to_string(ctx->channelId + 1), cv::Point(10, 25),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
-        const auto drawBoxes = [&bgrMat](const std::vector<DrawBox>& boxes, const cv::Scalar& color) {
+        // Every AI result was inferred from the fixed 320x180 scaler branch.
+        // Map coordinates back to this original-resolution display frame.
+        const double scaleX = static_cast<double>(bgrMat.cols) / AI_FRAME_WIDTH;
+        const double scaleY = static_cast<double>(bgrMat.rows) / AI_FRAME_HEIGHT;
+        const auto drawBoxes = [&bgrMat, scaleX, scaleY](const std::vector<DrawBox>& boxes, const cv::Scalar& color) {
             for (const DrawBox& box : boxes) {
-            const int x = std::max(0, std::min(box.x, bgrMat.cols - 1));
-            const int y = std::max(0, std::min(box.y, bgrMat.rows - 1));
-            const int w = std::max(1, std::min(box.width, bgrMat.cols - x));
-            const int h = std::max(1, std::min(box.height, bgrMat.rows - y));
+            const int x = std::max(0, std::min(static_cast<int>(std::lround(box.x * scaleX)), bgrMat.cols - 1));
+            const int y = std::max(0, std::min(static_cast<int>(std::lround(box.y * scaleY)), bgrMat.rows - 1));
+            const int w = std::max(1, std::min(static_cast<int>(std::lround(box.width * scaleX)), bgrMat.cols - x));
+            const int h = std::max(1, std::min(static_cast<int>(std::lround(box.height * scaleY)), bgrMat.rows - y));
             cv::rectangle(bgrMat, cv::Rect(x, y, w, h), color, 2);
             cv::putText(bgrMat, box.label.toStdString(), cv::Point(x, std::max(14, y - 4)),
                         cv::FONT_HERSHEY_SIMPLEX, 0.45, color, 2);
             for (const DrawKeypoint& point : box.keypoints) {
-                if (point.x < 0 || point.y < 0 || point.x >= bgrMat.cols || point.y >= bgrMat.rows) continue;
-                cv::circle(bgrMat, cv::Point(point.x, point.y), 3, color, cv::FILLED, cv::LINE_AA);
+                const int pointX = static_cast<int>(std::lround(point.x * scaleX));
+                const int pointY = static_cast<int>(std::lround(point.y * scaleY));
+                if (pointX < 0 || pointY < 0 || pointX >= bgrMat.cols || pointY >= bgrMat.rows) continue;
+                cv::circle(bgrMat, cv::Point(pointX, pointY), 3, color, cv::FILLED, cv::LINE_AA);
             }
             }
         };
@@ -251,7 +258,7 @@ static QRETURN on_fail_callback(
 // 建立單一路 RTSP 的狀態、佇列與畫面更新旗標。
 ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
     : channelId(id), url(streamUrl), m_pLabel(pLabel),
-      pClient(nullptr),
+      pClient(nullptr), pAiScaler(nullptr),
       m_nVideoWidth(0), m_nVideoHeight(0), m_dVideoFrameRate(0.0), m_nVideoEncoderFormat(0),
       m_frameCount(0), m_bDisplayEnabled(true),
       m_pushFrameCount(0), m_decFrameCount(0),
@@ -341,8 +348,18 @@ bool ChannelContext::start() {
     return true;
 }
 
-// 清空此路尚未消費的 AI 與顯示畫面，不操作 QCAP 所有權。
+// 停止 AI scaler 並清空此路尚未消費的 AI 與顯示畫面。
 void ChannelContext::cleanupPipeline() {
+    qcap2_video_scaler_t* localScaler = nullptr;
+    {
+        QMutexLocker locker(&m_mutex);
+        localScaler = pAiScaler;
+        pAiScaler = nullptr;
+    }
+    if (localScaler) {
+        qcap2_video_scaler_stop(localScaler);
+        qcap2_video_scaler_delete(localScaler);
+    }
     std::lock_guard<std::mutex> queueLocker(m_aiQueueMutex);
     m_aiFrames.clear();
     m_displayFrames.clear();
@@ -415,6 +432,10 @@ QRETURN ChannelContext::onConnected(
             need_cleanup = true;
         }
     }
+    {
+        QMutexLocker locker(&m_mutex);
+        need_cleanup = need_cleanup || pAiScaler != nullptr;
+    }
     if (need_cleanup) {
         qDebug() << "CH" << channelId << "Reconnecting: Cleaning up previous pipeline...";
         cleanupPipeline();
@@ -433,6 +454,40 @@ QRETURN ChannelContext::onConnected(
     m_dVideoFrameRate = dVideoFrameRate;
     m_nVideoEncoderFormat = nVideoEncoderFormat;
 
+    // The display branch keeps the decoder's original SYSBUF. This separate
+    // qcap2 scaler branch produces a fixed NV12 SYSBUF for all QDEEP models.
+    qcap2_video_scaler_t* scaler = qcap2_video_scaler_new();
+    if (!scaler) {
+        qCritical() << "CH" << channelId << "cannot create AI scaler";
+        m_statusInfo = QStringLiteral("AI scaler creation failed");
+        return QCAP_RT_OK;
+    }
+    qcap2_video_scaler_set_backend_type(scaler, QCAP2_VIDEO_SCALER_BACKEND_TYPE_DEFAULT);
+    qcap2_video_format_t* scalerFormat = qcap2_video_format_new();
+    if (!scalerFormat) {
+        qcap2_video_scaler_delete(scaler);
+        qCritical() << "CH" << channelId << "cannot create AI scaler format";
+        m_statusInfo = QStringLiteral("AI scaler format creation failed");
+        return QCAP_RT_OK;
+    }
+    qcap2_video_format_set_property(scalerFormat, QCAP_COLORSPACE_TYPE_NV12,
+                                    AI_FRAME_WIDTH, AI_FRAME_HEIGHT,
+                                    bVideoIsInterleaved, dVideoFrameRate);
+    qcap2_video_scaler_set_video_format(scaler, scalerFormat);
+    qcap2_video_format_delete(scalerFormat);
+    qcap2_video_scaler_set_frame_count(scaler, 8);
+    qcap2_video_scaler_set_src_buffer_hint(scaler, QCAP2_BUFFER_HINT_DEFAULT);
+    qcap2_video_scaler_set_dst_buffer_hint(scaler, QCAP2_BUFFER_HINT_DEFAULT);
+    qcap2_video_scaler_set_auto_run(scaler, true);
+    const QRESULT scalerResult = qcap2_video_scaler_start(scaler);
+    if (scalerResult != QCAP_RS_SUCCESSFUL) {
+        qCritical() << "CH" << channelId << "cannot start AI scaler:" << scalerResult;
+        qcap2_video_scaler_delete(scaler);
+        m_statusInfo = QStringLiteral("AI scaler start failed (%1)").arg(scalerResult);
+        return QCAP_RT_OK;
+    }
+    pAiScaler = scaler;
+
     QString formatStr;
     switch (nVideoEncoderFormat) {
     case QCAP_ENCODER_FORMAT_H264: formatStr = "H.264"; break;
@@ -443,15 +498,17 @@ QRETURN ChannelContext::onConnected(
     default: formatStr = QString("Unknown (%1)").arg(nVideoEncoderFormat); break;
     }
 
-    m_statusInfo = QString("%1x%2 @%3fps (%4)")
-            .arg(nVideoWidth).arg(nVideoHeight).arg(dVideoFrameRate).arg(formatStr);
+    m_statusInfo = QString("%1x%2 @%3fps (%4), AI %5x%6")
+            .arg(nVideoWidth).arg(nVideoHeight).arg(dVideoFrameRate).arg(formatStr)
+            .arg(AI_FRAME_WIDTH).arg(AI_FRAME_HEIGHT);
 
     qDebug() << "CH" << channelId << "Connected info:" << m_statusInfo;
 
     return QCAP_RT_OK;
 }
 
-// 複製 decoder callback 的畫面，分送到顯示與 AI 佇列，絕不保留 QCAP buffer。
+// 將 decoder SYSBUF 分成兩條：原尺寸 copy 給顯示；qcap2 scaler 的 320x180
+// NV12 copy 給 AI queue，兩邊都不保留 QCAP/scaler 所有的 rcbuffer。
 QRETURN ChannelContext::onDecodedVideoFrame(
     double dSampleTime, BYTE* pFrameBuffer, ULONG nFrameBufferLen)
 {
@@ -474,27 +531,47 @@ QRETURN ChannelContext::onDecodedVideoFrame(
 
     if (!bSendBuffer && !bDisplayEnabled) return QCAP_RT_OK;
 
-    // Complete the application-owned copy before this callback returns. The
-    // QCAP callback buffer is only locked/unlocked here; it is never released
-    // by this application.
+    // The callback SYSBUF remains QCAP-owned. It is used as the scaler input
+    // only during this callback and is never released by this application.
     qcap2_rcbuffer_t* pQcapFrame = qcap2_rcbuffer_cast(pFrameBuffer, nFrameBufferLen);
-    std::shared_ptr<SharedFrame> frame = pQcapFrame
-        ? copyQcapFrame(channelId, pQcapFrame)
-        : copyRawNV12Frame(channelId, pFrameBuffer, nFrameBufferLen, width, height);
-    if (!frame) {
-        qWarning() << "[QCAP decoder] CH" << channelId
-                   << "cannot copy decoded SYSBUF:" << nFrameBufferLen
-                   << "bytes for" << width << "x" << height;
-        return QCAP_RT_OK;
+    if (bDisplayEnabled) {
+        std::shared_ptr<SharedFrame> displayFrame = pQcapFrame
+            ? copyQcapFrame(channelId, pQcapFrame)
+            : copyRawNV12Frame(channelId, pFrameBuffer, nFrameBufferLen, width, height);
+        if (!displayFrame) {
+            qWarning() << "[QCAP decoder] CH" << channelId
+                       << "cannot copy original display SYSBUF:" << nFrameBufferLen
+                       << "bytes for" << width << "x" << height;
+        } else {
+            enqueueDisplayFrame(displayFrame);
+        }
     }
 
-    // Both consumers receive a shared ownership reference only after the copy
-    // above is complete. Their queues do not contain any QCAP rcbuffer.
-    if (bDisplayEnabled) {
-        enqueueDisplayFrame(frame);
-    }
     if (bSendBuffer) {
-        if (enqueueAIFrame(frame)) {
+        qcap2_rcbuffer_t* scaledBuffer = nullptr;
+        QRESULT scalerResult = QCAP_RS_ERROR_GENERAL;
+        std::shared_ptr<SharedFrame> aiFrame;
+        // Keep the scaler valid through push/pop/copy.  stop() and a reconnect
+        // take this same per-channel mutex before deleting it, while channels
+        // never contend with one another.
+        {
+            QMutexLocker scalerLocker(&m_mutex);
+            if (pQcapFrame && pAiScaler) {
+                scalerResult = qcap2_video_scaler_push(pAiScaler, pQcapFrame);
+                if (scalerResult == QCAP_RS_SUCCESSFUL)
+                    scalerResult = qcap2_video_scaler_pop(pAiScaler, &scaledBuffer);
+            }
+            if (scalerResult == QCAP_RS_SUCCESSFUL && scaledBuffer) {
+                aiFrame = copyQcapFrame(channelId, scaledBuffer);
+                qcap2_rcbuffer_release(scaledBuffer);
+            }
+        }
+        if (scalerResult != QCAP_RS_SUCCESSFUL || !scaledBuffer) {
+            qWarning() << "[AI scaler] CH" << channelId << "push/pop failed:" << scalerResult;
+        } else if (!aiFrame || aiFrame->width != AI_FRAME_WIDTH || aiFrame->height != AI_FRAME_HEIGHT) {
+            qWarning() << "[AI scaler] CH" << channelId << "invalid scaled frame"
+                       << (aiFrame ? aiFrame->width : 0) << "x" << (aiFrame ? aiFrame->height : 0);
+        } else if (enqueueAIFrame(aiFrame)) {
             g_pMainwindow->cv.notify_one();
         }
     }

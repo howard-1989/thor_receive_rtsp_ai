@@ -41,6 +41,8 @@ namespace QDEEP_API {
 
 // ── AI Constants ────────────────────────────────────────────────────────────
 #define BOX_SIZE 100
+#define AI_FRAME_WIDTH 320
+#define AI_FRAME_HEIGHT 180
 // UI/source-channel storage.  This is deliberately independent from the
 // QDEEP batch allocation below.
 #define MAX_BATCH 4
@@ -158,6 +160,9 @@ struct ChannelContext {
     QLabel* m_pLabel;
 
     PVOID pClient;
+    // Dedicated qcap2 scaler branch: decoded SYSBUF -> 320x180 NV12 SYSBUF
+    // for AI only. The original decoded buffer remains the display branch.
+    qcap2_video_scaler_t* pAiScaler;
     // Two independent depth-two/drop-oldest queues. They own shared CPU
     // frames, never QCAP rc-buffers, so queue ownership cannot stall or
     // corrupt the client decoder callback.
