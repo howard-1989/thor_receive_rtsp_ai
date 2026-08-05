@@ -41,6 +41,8 @@ namespace QDEEP_API {
 
 // ── AI Constants ────────────────────────────────────────────────────────────
 #define BOX_SIZE 100
+#define AI_FRAME_WIDTH 320
+#define AI_FRAME_HEIGHT 180
 // UI/source-channel storage.  This is deliberately independent from the
 // QDEEP batch allocation below.
 #define MAX_BATCH 4
@@ -65,13 +67,15 @@ struct DrawBox {
     std::vector<DrawKeypoint> keypoints;
 };
 
-// Owned copy of a decoded client frame.  It is immutable after construction
-// and can therefore be safely shared by display, model_0, and its Layer 2 child.
+// Owned copy of a decoded client frame. A scaled AI scheduling frame retains
+// its independent native-resolution inputs for the face and plate workers.
 struct SharedFrame {
     int channelId;
     ULONG width;
     ULONG height;
     std::vector<BYTE> nv12;
+    std::shared_ptr<SharedFrame> faceInputFrame;
+    std::shared_ptr<SharedFrame> plateInputFrame;
 };
 
 struct InferenceTimingStats {
@@ -158,6 +162,10 @@ struct ChannelContext {
     QLabel* m_pLabel;
 
     PVOID pClient;
+    // Dedicated qcap2 scaler branch: decoded SYSBUF -> 320x180 NV12 SYSBUF
+    // for Layer 1/3 AI. Layer 2 face/plate retain shared ownership of a native
+    // decoder copy, never the QCAP callback rcbuffer.
+    qcap2_video_scaler_t* pAiScaler;
     // Two independent depth-two/drop-oldest queues. They own shared CPU
     // frames, never QCAP rc-buffers, so queue ownership cannot stall or
     // corrupt the client decoder callback.
@@ -179,7 +187,6 @@ struct ChannelContext {
     // Display toggle
     bool m_bDisplayEnabled;
     std::shared_ptr<std::atomic<bool>> m_pPendingUpdate;
-    std::atomic<int> m_displayFrameCount;
 
     // Profiling
     QElapsedTimer m_pushTimer;
@@ -199,6 +206,7 @@ struct ChannelContext {
     void stop();
     void cleanupPipeline();
     void setDisplayEnabled(bool enabled);
+    bool hasAIFrameCapacity();
     bool enqueueAIFrame(const std::shared_ptr<SharedFrame>& frame);
     std::shared_ptr<SharedFrame> takeLatestAIFrame();
     bool enqueueDisplayFrame(const std::shared_ptr<SharedFrame>& frame);
@@ -262,6 +270,7 @@ public:
     int roundExpected;
     int roundCompleted;
     std::atomic<bool> ai_running;
+    std::atomic<bool> display_running;
     std::thread* pAiThread;
     std::thread* pDisplayThread;
     int ready_count;

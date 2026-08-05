@@ -14,24 +14,25 @@
 #include <opencv2/opencv.hpp>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 
 MainWindow *g_pMainwindow = nullptr;
 
 // Layer 1 runs model_0 once for all channels. Layer 2 uses a face-landmark
 // detector per channel after model_0 has completed for that frame.
 static const char* kLayer1Model0 =
-     "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/taiwantraffic_batch8/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG";
+     "/home/nvidia/Music/thor_receive_rtsp_ai/new_model/taiwantraffic_batch8/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG";
     // "/home/nvidia/Downloads/MY/model/people/QDEEP.OD.TINY.PERSON.V10N.CFG";
 static const char* kLayer1Model1 = kLayer1Model0;
 static const char* kLayer1Model2 = kLayer1Model0;
 static const char* kLayer2FaceModel =
-    // "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/face/QDEEP.OD.FACE.LANDMARK.5KPS.CFG";
+    // "/home/nvidia/Music/thor_receive_rtsp_ai/new_model/face/QDEEP.OD.FACE.LANDMARK.5KPS.CFG";
     "/home/nvidia/Downloads/MY/model/face/QDEEP.OD.FACE.LANDMARK.5KPS.CFG";
 static const char* kLayer2PlateModel =
-    // "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/lpr_batch8/QDEEP.OD.LICENSE.PLATE.RECOGNITION.LAW.TINY.CFG";
+    // "/home/nvidia/Music/thor_receive_rtsp_ai/new_model/lpr_batch8/QDEEP.OD.LICENSE.PLATE.RECOGNITION.LAW.TINY.CFG";
     "/home/nvidia/Downloads/MY/model/lpr/QDEEP.OD.LICENSE.PLATE.RECOGNITION.LAW.TINY.CFG";
 static const char* kLayer3PersonModel =
-    // "/home/nvidia/Documents/thor_receive_rtsp_ai/new_model/person_batch8/QDEEP.OD.TINY.PERSON.V10N.CFG";
+    // "/home/nvidia/Music/thor_receive_rtsp_ai/new_model/person_batch8/QDEEP.OD.TINY.PERSON.V10N.CFG";
     "/home/nvidia/Downloads/MY/model/people/QDEEP.OD.TINY.PERSON.V10N.CFG";
 
 extern "C" {
@@ -62,8 +63,10 @@ static QString plateTextFromFeatureVector(const QDEEP_API::QDEEP_OBJECT_DETECT_B
 // 將最新解碼畫面與各層推論框以 OpenCV 疊圖，並排入 Qt UI 執行緒更新。
 static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFrame>& frame)
 {
-    if (!ctx || !frame || !ctx->m_pLabel || !ctx->m_pPendingUpdate ||
-        ctx->m_pPendingUpdate->exchange(true)) {
+    if (!ctx || !frame || !ctx->m_pLabel || !ctx->m_pPendingUpdate) {
+        return;
+    }
+    if (ctx->m_pPendingUpdate->exchange(true)) {
         return;
     }
 
@@ -98,37 +101,53 @@ static void postDisplayFrame(ChannelContext* ctx, const std::shared_ptr<SharedFr
         }
         cv::putText(bgrMat, "CH " + std::to_string(ctx->channelId + 1), cv::Point(10, 25),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
-        const auto drawBoxes = [&bgrMat](const std::vector<DrawBox>& boxes, const cv::Scalar& color) {
+        // Layer 1/3 infer from the 320x180 scaler branch, while Layer 2
+        // face/plate infer from the native decoded frame. Scale each result
+        // according to the buffer that produced it.
+        const auto drawBoxes = [&bgrMat](const std::vector<DrawBox>& boxes, const cv::Scalar& color,
+                                        ULONG inputWidth, ULONG inputHeight) {
+            if (inputWidth == 0 || inputHeight == 0) return;
+            const double scaleX = static_cast<double>(bgrMat.cols) / inputWidth;
+            const double scaleY = static_cast<double>(bgrMat.rows) / inputHeight;
             for (const DrawBox& box : boxes) {
-            const int x = std::max(0, std::min(box.x, bgrMat.cols - 1));
-            const int y = std::max(0, std::min(box.y, bgrMat.rows - 1));
-            const int w = std::max(1, std::min(box.width, bgrMat.cols - x));
-            const int h = std::max(1, std::min(box.height, bgrMat.rows - y));
+            const int x = std::max(0, std::min(static_cast<int>(std::lround(box.x * scaleX)), bgrMat.cols - 1));
+            const int y = std::max(0, std::min(static_cast<int>(std::lround(box.y * scaleY)), bgrMat.rows - 1));
+            const int w = std::max(1, std::min(static_cast<int>(std::lround(box.width * scaleX)), bgrMat.cols - x));
+            const int h = std::max(1, std::min(static_cast<int>(std::lround(box.height * scaleY)), bgrMat.rows - y));
             cv::rectangle(bgrMat, cv::Rect(x, y, w, h), color, 2);
             cv::putText(bgrMat, box.label.toStdString(), cv::Point(x, std::max(14, y - 4)),
                         cv::FONT_HERSHEY_SIMPLEX, 0.45, color, 2);
             for (const DrawKeypoint& point : box.keypoints) {
-                if (point.x < 0 || point.y < 0 || point.x >= bgrMat.cols || point.y >= bgrMat.rows) continue;
-                cv::circle(bgrMat, cv::Point(point.x, point.y), 3, color, cv::FILLED, cv::LINE_AA);
+                const int pointX = static_cast<int>(std::lround(point.x * scaleX));
+                const int pointY = static_cast<int>(std::lround(point.y * scaleY));
+                if (pointX < 0 || pointY < 0 || pointX >= bgrMat.cols || pointY >= bgrMat.rows) continue;
+                cv::circle(bgrMat, cv::Point(pointX, pointY), 3, color, cv::FILLED, cv::LINE_AA);
             }
             }
         };
-        drawBoxes(model0Boxes, cv::Scalar(0, 255, 0));
-        drawBoxes(model1Boxes, cv::Scalar(0, 255, 255));
-        drawBoxes(model2Boxes, cv::Scalar(255, 0, 255));
-        drawBoxes(faceBoxes, cv::Scalar(255, 128, 0));
-        drawBoxes(plateBoxes, cv::Scalar(0, 215, 255));
-        drawBoxes(layer3Model0Boxes, cv::Scalar(255, 255, 0));
-        drawBoxes(layer3Model1Boxes, cv::Scalar(128, 255, 128));
+        drawBoxes(model0Boxes, cv::Scalar(0, 255, 0), AI_FRAME_WIDTH, AI_FRAME_HEIGHT);
+        drawBoxes(model1Boxes, cv::Scalar(0, 255, 255), AI_FRAME_WIDTH, AI_FRAME_HEIGHT);
+        drawBoxes(model2Boxes, cv::Scalar(255, 0, 255), AI_FRAME_WIDTH, AI_FRAME_HEIGHT);
+        drawBoxes(faceBoxes, cv::Scalar(255, 128, 0), frame->width, frame->height);
+        drawBoxes(plateBoxes, cv::Scalar(0, 215, 255), frame->width, frame->height);
+        drawBoxes(layer3Model0Boxes, cv::Scalar(255, 255, 0), AI_FRAME_WIDTH, AI_FRAME_HEIGHT);
+        drawBoxes(layer3Model1Boxes, cv::Scalar(128, 255, 128), AI_FRAME_WIDTH, AI_FRAME_HEIGHT);
     }
 
     const QImage image = cvMatToQImage(bgrMat);
+    if (image.isNull()) {
+        ctx->m_pPendingUpdate->store(false);
+        return;
+    }
     QPointer<QLabel> safeLabel = ctx->m_pLabel;
     std::shared_ptr<std::atomic<bool>> pending = ctx->m_pPendingUpdate;
-    QMetaObject::invokeMethod(ctx->m_pLabel, [safeLabel, image, pending]() {
+    const bool posted = QMetaObject::invokeMethod(ctx->m_pLabel, [safeLabel, image, pending]() {
         if (safeLabel) safeLabel->setPixmap(QPixmap::fromImage(image));
         if (pending) pending->store(false);
     }, Qt::QueuedConnection);
+    if (!posted) {
+        ctx->m_pPendingUpdate->store(false);
+    }
 }
 
 // 複製 raw NV12 解碼資料成應用程式自行持有、可跨 thread 共用的 frame。
@@ -142,6 +161,20 @@ static std::shared_ptr<SharedFrame> copyRawNV12Frame(
     frame->width = width;
     frame->height = height;
     frame->nv12.assign(source, source + expectedBytes);
+    return frame;
+}
+
+// QDEEP receives a writable pointer despite documenting it as input. Keep the
+// display, face, and plate buffers physically separate whenever a native model
+// frame is actually scheduled.
+static std::shared_ptr<SharedFrame> cloneNV12Frame(const std::shared_ptr<SharedFrame>& source)
+{
+    if (!source || source->width == 0 || source->height == 0 || source->nv12.empty()) return nullptr;
+    std::shared_ptr<SharedFrame> frame = std::make_shared<SharedFrame>();
+    frame->channelId = source->channelId;
+    frame->width = source->width;
+    frame->height = source->height;
+    frame->nv12 = source->nv12;
     return frame;
 }
 
@@ -251,7 +284,7 @@ static QRETURN on_fail_callback(
 // 建立單一路 RTSP 的狀態、佇列與畫面更新旗標。
 ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
     : channelId(id), url(streamUrl), m_pLabel(pLabel),
-      pClient(nullptr),
+      pClient(nullptr), pAiScaler(nullptr),
       m_nVideoWidth(0), m_nVideoHeight(0), m_dVideoFrameRate(0.0), m_nVideoEncoderFormat(0),
       m_frameCount(0), m_bDisplayEnabled(true),
       m_pushFrameCount(0), m_decFrameCount(0),
@@ -259,7 +292,6 @@ ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
       m_bSendBuffer(false), m_lastProcessTime(0.0), m_bFrameReady(false)
 {
     m_pPendingUpdate = std::make_shared<std::atomic<bool>>(false);
-    m_displayFrameCount = 0;
 }
 
 // 解構前確保停止此路 RTSP client 並釋放其 pipeline。
@@ -341,8 +373,18 @@ bool ChannelContext::start() {
     return true;
 }
 
-// 清空此路尚未消費的 AI 與顯示畫面，不操作 QCAP 所有權。
+// 停止 AI scaler 並清空此路尚未消費的 AI 與顯示畫面。
 void ChannelContext::cleanupPipeline() {
+    qcap2_video_scaler_t* localScaler = nullptr;
+    {
+        QMutexLocker locker(&m_mutex);
+        localScaler = pAiScaler;
+        pAiScaler = nullptr;
+    }
+    if (localScaler) {
+        qcap2_video_scaler_stop(localScaler);
+        qcap2_video_scaler_delete(localScaler);
+    }
     std::lock_guard<std::mutex> queueLocker(m_aiQueueMutex);
     m_aiFrames.clear();
     m_displayFrames.clear();
@@ -394,6 +436,14 @@ void ChannelContext::setDisplayEnabled(bool enabled) {
     m_bDisplayEnabled = enabled;
 }
 
+// Do not prepare 1080p model inputs for a frame that the depth-two AI queue
+// will immediately discard. Display has its own queue and stays responsive.
+bool ChannelContext::hasAIFrameCapacity()
+{
+    std::lock_guard<std::mutex> queueLocker(m_aiQueueMutex);
+    return m_aiFrames.size() < 2;
+}
+
 // 保存新連線的影像格式與尺寸；重連時清掉前一次遺留的 frame。
 QRETURN ChannelContext::onConnected(
         PVOID pClient,
@@ -415,6 +465,10 @@ QRETURN ChannelContext::onConnected(
             need_cleanup = true;
         }
     }
+    {
+        QMutexLocker locker(&m_mutex);
+        need_cleanup = need_cleanup || pAiScaler != nullptr;
+    }
     if (need_cleanup) {
         qDebug() << "CH" << channelId << "Reconnecting: Cleaning up previous pipeline...";
         cleanupPipeline();
@@ -433,6 +487,40 @@ QRETURN ChannelContext::onConnected(
     m_dVideoFrameRate = dVideoFrameRate;
     m_nVideoEncoderFormat = nVideoEncoderFormat;
 
+    // The display branch keeps the decoder's original SYSBUF. This separate
+    // qcap2 scaler branch produces a fixed NV12 SYSBUF for all QDEEP models.
+    qcap2_video_scaler_t* scaler = qcap2_video_scaler_new();
+    if (!scaler) {
+        qCritical() << "CH" << channelId << "cannot create AI scaler";
+        m_statusInfo = QStringLiteral("AI scaler creation failed");
+        return QCAP_RT_OK;
+    }
+    qcap2_video_scaler_set_backend_type(scaler, QCAP2_VIDEO_SCALER_BACKEND_TYPE_DEFAULT);
+    qcap2_video_format_t* scalerFormat = qcap2_video_format_new();
+    if (!scalerFormat) {
+        qcap2_video_scaler_delete(scaler);
+        qCritical() << "CH" << channelId << "cannot create AI scaler format";
+        m_statusInfo = QStringLiteral("AI scaler format creation failed");
+        return QCAP_RT_OK;
+    }
+    qcap2_video_format_set_property(scalerFormat, QCAP_COLORSPACE_TYPE_NV12,
+                                    AI_FRAME_WIDTH, AI_FRAME_HEIGHT,
+                                    bVideoIsInterleaved, dVideoFrameRate);
+    qcap2_video_scaler_set_video_format(scaler, scalerFormat);
+    qcap2_video_format_delete(scalerFormat);
+    qcap2_video_scaler_set_frame_count(scaler, 8);
+    qcap2_video_scaler_set_src_buffer_hint(scaler, QCAP2_BUFFER_HINT_DEFAULT);
+    qcap2_video_scaler_set_dst_buffer_hint(scaler, QCAP2_BUFFER_HINT_DEFAULT);
+    qcap2_video_scaler_set_auto_run(scaler, true);
+    const QRESULT scalerResult = qcap2_video_scaler_start(scaler);
+    if (scalerResult != QCAP_RS_SUCCESSFUL) {
+        qCritical() << "CH" << channelId << "cannot start AI scaler:" << scalerResult;
+        qcap2_video_scaler_delete(scaler);
+        m_statusInfo = QStringLiteral("AI scaler start failed (%1)").arg(scalerResult);
+        return QCAP_RT_OK;
+    }
+    pAiScaler = scaler;
+
     QString formatStr;
     switch (nVideoEncoderFormat) {
     case QCAP_ENCODER_FORMAT_H264: formatStr = "H.264"; break;
@@ -443,15 +531,18 @@ QRETURN ChannelContext::onConnected(
     default: formatStr = QString("Unknown (%1)").arg(nVideoEncoderFormat); break;
     }
 
-    m_statusInfo = QString("%1x%2 @%3fps (%4)")
-            .arg(nVideoWidth).arg(nVideoHeight).arg(dVideoFrameRate).arg(formatStr);
+    m_statusInfo = QString("%1x%2 @%3fps (%4), AI %5x%6")
+            .arg(nVideoWidth).arg(nVideoHeight).arg(dVideoFrameRate).arg(formatStr)
+            .arg(AI_FRAME_WIDTH).arg(AI_FRAME_HEIGHT);
 
     qDebug() << "CH" << channelId << "Connected info:" << m_statusInfo;
 
     return QCAP_RT_OK;
 }
 
-// 複製 decoder callback 的畫面，分送到顯示與 AI 佇列，絕不保留 QCAP buffer。
+// 將 decoder SYSBUF 分成兩條：一份 application-owned 原尺寸 copy 供顯示與
+// Layer 2 face/plate 唯讀共用；qcap2 scaler 的 320x180 NV12 copy 則供
+// Layer 1/3 使用。兩條都不保留 QCAP/scaler 所有的 rcbuffer。
 QRETURN ChannelContext::onDecodedVideoFrame(
     double dSampleTime, BYTE* pFrameBuffer, ULONG nFrameBufferLen)
 {
@@ -472,30 +563,83 @@ QRETURN ChannelContext::onDecodedVideoFrame(
         bDisplayEnabled = m_bDisplayEnabled;
     }
 
+    // Native FR/plate copies are expensive. Only produce them for a frame the
+    // AI queue can still accept; the display queue is intentionally separate.
+    const bool submitAIFrame = bSendBuffer && hasAIFrameCapacity();
+    const bool needFaceNativeFrame = submitAIFrame && g_pMainwindow &&
+        g_pMainwindow->m_bEnableFaceModel.load();
+    const bool needPlateNativeFrame = submitAIFrame && g_pMainwindow &&
+        g_pMainwindow->m_bEnablePlateModel.load();
+    const bool needNativeLayer2Frame = needFaceNativeFrame || needPlateNativeFrame;
     if (!bSendBuffer && !bDisplayEnabled) return QCAP_RT_OK;
 
-    // Complete the application-owned copy before this callback returns. The
-    // QCAP callback buffer is only locked/unlocked here; it is never released
-    // by this application.
+    // The callback SYSBUF remains QCAP-owned. It is used as the scaler input
+    // only during this callback and is never released by this application.
     qcap2_rcbuffer_t* pQcapFrame = qcap2_rcbuffer_cast(pFrameBuffer, nFrameBufferLen);
-    std::shared_ptr<SharedFrame> frame = pQcapFrame
-        ? copyQcapFrame(channelId, pQcapFrame)
-        : copyRawNV12Frame(channelId, pFrameBuffer, nFrameBufferLen, width, height);
-    if (!frame) {
-        qWarning() << "[QCAP decoder] CH" << channelId
-                   << "cannot copy decoded SYSBUF:" << nFrameBufferLen
-                   << "bytes for" << width << "x" << height;
-        return QCAP_RT_OK;
+    std::shared_ptr<SharedFrame> nativeFrame;
+    std::shared_ptr<SharedFrame> faceInputFrame;
+    std::shared_ptr<SharedFrame> plateInputFrame;
+    if (bDisplayEnabled || needNativeLayer2Frame) {
+        nativeFrame = pQcapFrame
+            ? copyQcapFrame(channelId, pQcapFrame)
+            : copyRawNV12Frame(channelId, pFrameBuffer, nFrameBufferLen, width, height);
+        if (!nativeFrame) {
+            qWarning() << "[QCAP decoder] CH" << channelId
+                       << "cannot copy original decoded SYSBUF:" << nFrameBufferLen
+                       << "bytes for" << width << "x" << height;
+        } else if (bDisplayEnabled) {
+            enqueueDisplayFrame(nativeFrame);
+        }
+
+        // Keep display, FR, and plate independent. Crucially, these extra
+        // 1080p copies are made only when submitAIFrame is true, never for a
+        // decoded frame that is going to be dropped by the full AI queue.
+        bool nativeFrameClaimed = bDisplayEnabled;
+        if (needFaceNativeFrame && nativeFrame) {
+            faceInputFrame = nativeFrameClaimed ? cloneNV12Frame(nativeFrame) : nativeFrame;
+            nativeFrameClaimed = nativeFrameClaimed || faceInputFrame != nullptr;
+        }
+        if (needPlateNativeFrame && nativeFrame) {
+            plateInputFrame = nativeFrameClaimed ? cloneNV12Frame(nativeFrame) : nativeFrame;
+            nativeFrameClaimed = nativeFrameClaimed || plateInputFrame != nullptr;
+        }
+        if ((needFaceNativeFrame && !faceInputFrame) ||
+            (needPlateNativeFrame && !plateInputFrame)) {
+            qWarning() << "[Layer2 native input] CH" << channelId
+                       << "could not allocate a native 1080p model buffer";
+        }
     }
 
-    // Both consumers receive a shared ownership reference only after the copy
-    // above is complete. Their queues do not contain any QCAP rcbuffer.
-    if (bDisplayEnabled) {
-        enqueueDisplayFrame(frame);
-    }
-    if (bSendBuffer) {
-        if (enqueueAIFrame(frame)) {
-            g_pMainwindow->cv.notify_one();
+    if (submitAIFrame) {
+        qcap2_rcbuffer_t* scaledBuffer = nullptr;
+        QRESULT scalerResult = QCAP_RS_ERROR_GENERAL;
+        std::shared_ptr<SharedFrame> aiFrame;
+        // Keep the scaler valid through push/pop/copy.  stop() and a reconnect
+        // take this same per-channel mutex before deleting it, while channels
+        // never contend with one another.
+        {
+            QMutexLocker scalerLocker(&m_mutex);
+            if (pQcapFrame && pAiScaler) {
+                scalerResult = qcap2_video_scaler_push(pAiScaler, pQcapFrame);
+                if (scalerResult == QCAP_RS_SUCCESSFUL)
+                    scalerResult = qcap2_video_scaler_pop(pAiScaler, &scaledBuffer);
+            }
+            if (scalerResult == QCAP_RS_SUCCESSFUL && scaledBuffer) {
+                aiFrame = copyQcapFrame(channelId, scaledBuffer);
+                qcap2_rcbuffer_release(scaledBuffer);
+            }
+        }
+        if (scalerResult != QCAP_RS_SUCCESSFUL || !scaledBuffer) {
+            qWarning() << "[AI scaler] CH" << channelId << "push/pop failed:" << scalerResult;
+        } else if (!aiFrame || aiFrame->width != AI_FRAME_WIDTH || aiFrame->height != AI_FRAME_HEIGHT) {
+            qWarning() << "[AI scaler] CH" << channelId << "invalid scaled frame"
+                       << (aiFrame ? aiFrame->width : 0) << "x" << (aiFrame ? aiFrame->height : 0);
+        } else {
+            // The scaler frame remains the Layer 1/3 input. Layer 2 workers
+            // retain independent native-resolution NV12 allocations.
+            aiFrame->faceInputFrame = faceInputFrame;
+            aiFrame->plateInputFrame = plateInputFrame;
+            if (enqueueAIFrame(aiFrame)) g_pMainwindow->cv.notify_one();
         }
     }
 
@@ -520,7 +664,8 @@ MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), m_bShowOverlay(true), m_bEnableFaceModel(true), m_bEnablePlateModel(true), m_bFullscreen(false),
       // AI init
       m_bHalfRefreshRate(false),
-      flag(0), roundExpected(0), roundCompleted(0), ai_running(false), pAiThread(nullptr), pDisplayThread(nullptr),
+      flag(0), roundExpected(0), roundCompleted(0), ai_running(false), display_running(false),
+      pAiThread(nullptr), pDisplayThread(nullptr),
       ready_count(0), active_camera_count(0),
       layer1Model0Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_0", QString::fromLatin1(kLayer1Model0))),
       layer1Model1Path(qEnvironmentVariable("QDEEP_LAYER1_MODEL_1", QString::fromLatin1(kLayer1Model1))),
@@ -651,7 +796,7 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.190.128:554/session0.mpg"));
+            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.190.201:554/session0.mpg"));
         }
     }
 }
@@ -702,6 +847,11 @@ void MainWindow::onBtnStartClicked()
     btnStart->setEnabled(false);
     btnStop->setEnabled(true);
     lblStatus->setText("Status: Running");
+
+    // Keep rendering independent from model startup. Decoding may already be
+    // healthy even when a QDEEP model cannot be created.
+    display_running.store(true);
+    pDisplayThread = new std::thread(&MainWindow::display_thread, this);
 
     // Start AI inference
     yolo_start();
@@ -877,6 +1027,9 @@ void MainWindow::create_layer2_face_workers()
             QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
             QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_FACE_LANDMARK_5_KEYPOINTS,
             const_cast<CHAR*>(path.constData()), &worker->handle, faceFlags);
+        const QRESULT reservedResult = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(
+            reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));
+        Q_UNUSED(reservedResult);
         if (createResult != QCAP_RS_SUCCESSFUL || !worker->handle) {
             qCritical() << "[layer2/face] create failed for CH" << (ctx->channelId + 1)
                         << "result=" << createResult;
@@ -935,6 +1088,9 @@ void MainWindow::create_layer2_plate_workers()
             QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
             QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_LICENSE_PLATE_RECOGNITION_LAW_ENFORCEMENT,
             const_cast<CHAR*>(path.constData()), &worker->handle, plateFlags);
+        const QRESULT reservedResult = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(
+            reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));
+        Q_UNUSED(reservedResult);
         if (createResult != QCAP_RS_SUCCESSFUL || !worker->handle) {
             qCritical() << "[layer2/model_1 plate] create failed for CH" << (ctx->channelId + 1)
                         << "result=" << createResult;
@@ -997,6 +1153,9 @@ void MainWindow::create_layer1_batch_workers()
             QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
             const_cast<CHAR*>(path.constData()), &worker->handle, flag,
             static_cast<ULONG>(channelIds.size()));
+        const QRESULT reservedResult = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(
+            reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));
+        Q_UNUSED(reservedResult);
         if (createResult != QCAP_RS_SUCCESSFUL || !worker->handle) {
             qCritical() << "[layer1/model_" << modelId << "] create failed, result=" << createResult;
             continue;
@@ -1063,6 +1222,9 @@ void MainWindow::create_layer3_batch_workers()
             QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
             const_cast<CHAR*>(path.constData()), &worker->handle, flag,
             static_cast<ULONG>(channelIds.size()));
+        const QRESULT reservedResult = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(
+            reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));
+        Q_UNUSED(reservedResult);
         if (createResult != QCAP_RS_SUCCESSFUL || !worker->handle) {
             qCritical() << "[layer3/model_" << modelId << "] create failed, result=" << createResult;
             continue;
@@ -1145,13 +1307,13 @@ void MainWindow::yolo_start()
     for (const std::unique_ptr<Layer3BatchWorker>& worker : layer3BatchWorkers) {
         worker->thread = std::thread(&MainWindow::layer3_batch_inference_thread, this, worker.get());
     }
-    pDisplayThread = new std::thread(&MainWindow::display_thread, this);
 }
 
 // 通知、等待並銷毀全部 AI thread 與 QDEEP worker，避免 handle 併發釋放。
 void MainWindow::yolo_stop()
 {
     ai_running.store(false);
+    display_running.store(false);
     cv.notify_all();
     round_cv.notify_all();
     for (const std::unique_ptr<Layer1BatchWorker>& worker : layer1BatchWorkers) {
@@ -1484,13 +1646,18 @@ void MainWindow::layer2_face_inference_thread(Layer2FaceWorker* worker)
         }
         if (!frame) continue;
 
+        // Layer 1 passes its 320x180 scheduling frame here, but Layer 2 face
+        // reads its independent native decoded input (for example 1920x1080).
+        const std::shared_ptr<SharedFrame> modelFrame = frame->faceInputFrame
+            ? frame->faceInputFrame : frame;
+
         std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX> boxes(BOX_SIZE);
         ULONG boxSize = BOX_SIZE;
         QElapsedTimer inferenceTimer;
         inferenceTimer.start();
         const QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_UNCOMPRESSION_BUFFER(
-            worker->handle, QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12, frame->width, frame->height,
-            frame->nv12.data(), static_cast<ULONG>(frame->nv12.size()), boxes.data(), &boxSize, flag);
+            worker->handle, QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12, modelFrame->width, modelFrame->height,
+            modelFrame->nv12.data(), static_cast<ULONG>(modelFrame->nv12.size()), boxes.data(), &boxSize, flag);
         recordInferenceTiming(worker->timing, inferenceTimer.nsecsElapsed() / 1000000.0);
         if (result != QCAP_RS_SUCCESSFUL) {
             qWarning() << "[layer2/face] inference failed for CH" << (worker->channelId + 1)
@@ -1543,6 +1710,11 @@ void MainWindow::layer2_plate_inference_thread(Layer2PlateWorker* worker)
         }
         if (!frame) continue;
 
+        // Plate reads its independent native input while retaining no decoder
+        // callback buffer.
+        const std::shared_ptr<SharedFrame> modelFrame = frame->plateInputFrame
+            ? frame->plateInputFrame : frame;
+
         // This buffer is local to this worker invocation; no other channel or
         // thread can read/write the returned plate-recognition data.
         std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX> boxes(BOX_SIZE);
@@ -1550,8 +1722,8 @@ void MainWindow::layer2_plate_inference_thread(Layer2PlateWorker* worker)
         QElapsedTimer inferenceTimer;
         inferenceTimer.start();
         const QRESULT result = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_UNCOMPRESSION_BUFFER(
-            worker->handle, QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12, frame->width, frame->height,
-            frame->nv12.data(), static_cast<ULONG>(frame->nv12.size()), boxes.data(), &boxSize, plateFlags);
+            worker->handle, QDEEP_API::QDEEP_COLORSPACE_TYPE_NV12, modelFrame->width, modelFrame->height,
+            modelFrame->nv12.data(), static_cast<ULONG>(modelFrame->nv12.size()), boxes.data(), &boxSize, plateFlags);
         recordInferenceTiming(worker->timing, inferenceTimer.nsecsElapsed() / 1000000.0);
         if (result != QCAP_RS_SUCCESSFUL) {
             qWarning() << "[layer2/model_1 plate] inference failed for CH" << (worker->channelId + 1)
@@ -1660,7 +1832,7 @@ void MainWindow::layer3_batch_inference_thread(Layer3BatchWorker* worker)
 // 持續取每一路最新顯示 frame，交由 OpenCV 疊圖並排入 Qt UI 更新。
 void MainWindow::display_thread()
 {
-    while (ai_running.load()) {
+    while (display_running.load()) {
         bool displayedFrame = false;
         for (ChannelContext* ctx : channels) {
             std::shared_ptr<SharedFrame> frame = ctx->takeLatestDisplayFrame();
