@@ -9,10 +9,45 @@
 #include <QPointer>
 #include <QMetaObject>
 #include <QPixmap>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
 
 #include <opencv2/opencv.hpp>
 
 MainWindow *g_pMainwindow = nullptr;
+
+namespace {
+// Channel IDs are zero-based, so IDs 0 through 23 are RTSP channels 1 through
+// 24.  zznvcodec produces system-memory buffers, allowing both decoder types
+// to use the same scaler and display pipeline below.
+constexpr int kZznvcodecChannelLimit = 24;
+
+ULONG decoderTypeForChannel(int channelId)
+{
+    return channelId < kZznvcodecChannelLimit
+            ? static_cast<ULONG>(QCAP_DECODER_TYPE_ZZNVCODEC)
+            : static_cast<ULONG>(QCAP_DECODER_TYPE_SOFTWARE);
+}
+
+const char* decoderName(ULONG decoderType)
+{
+    return decoderType == QCAP_DECODER_TYPE_ZZNVCODEC
+            ? "zznvcodec"
+            : "software";
+}
+
+QString trafficModelPath()
+{
+    const QString configuredPath = qEnvironmentVariable("QDEEP_TRAFFIC_MODEL");
+    if (!configuredPath.isEmpty()) {
+        return configuredPath;
+    }
+
+    return QDir(QCoreApplication::applicationDirPath()).filePath(
+        "/home/nvidia/Music/thor_receive_rtsp_ai/new_model/taiwantraffic_batch8/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG");
+}
+} // namespace
 
 extern "C" {
 QDEEP_EXT_API QRESULT QDEEP_EXPORT QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(PVOID pDetector, ULONG* pCheckNum);
@@ -45,22 +80,18 @@ static QRETURN on_connected_callback(
     return ctx->onConnected(pClient, iSessionNum, nVideoEncoderFormat, nVideoWidth, nVideoHeight, bVideoIsInterleaved, dVideoFrameRate);
 }
 
-static QRETURN on_video_callback(
+static QRETURN on_decoder_video_callback(
         PVOID pClient,
         UINT iSessionNum,
         double dSampleTime,
-        BYTE * pStreamBuffer,
-        ULONG nStreamBufferLen,
-        BOOL bIsKeyFrame,
+        BYTE * pFrameBuffer,
+        ULONG nFrameBufferLen,
         PVOID pUserData)
 {
+    Q_UNUSED(pClient);
+    Q_UNUSED(iSessionNum);
     ChannelContext* ctx = static_cast<ChannelContext*>(pUserData);
-    return ctx->onVideoCallback(dSampleTime, pStreamBuffer, nStreamBufferLen, bIsKeyFrame);
-}
-
-static QRETURN on_event_vdec_callback(PVOID pUserData) {
-    ChannelContext* ctx = static_cast<ChannelContext*>(pUserData);
-    return ctx->onEventVdec();
+    return ctx->onDecodedVideoFrame(dSampleTime, pFrameBuffer, nFrameBufferLen);
 }
 
 static QRETURN on_fail_callback(
@@ -75,12 +106,9 @@ static QRETURN on_fail_callback(
 }
 
 // ── ChannelContext Implementation ───────────────────────────────────────────
-ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel, bool useGpuDecoder)
+ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
     : channelId(id), url(streamUrl), m_pLabel(pLabel),
-      pClient(nullptr), pVdec(nullptr), pEventHandlers(nullptr),
-      pEvent_vdec(nullptr),
-      pScaler2(nullptr), pScaler3(nullptr), m_bUseGpuDecoder(useGpuDecoder),
-      m_pCurrentAIRCBuffer(nullptr),
+      pClient(nullptr), pScaler2(nullptr),
       m_pAIQueue(nullptr),
       m_nVideoWidth(0), m_nVideoHeight(0), m_dVideoFrameRate(0.0), m_nVideoEncoderFormat(0),
       m_frameCount(0), m_bDisplayEnabled(true),
@@ -91,17 +119,12 @@ ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel,
 {
     m_pPendingUpdate = std::make_shared<std::atomic<bool>>(false);
     m_displayFrameCount = 0;
-    for (int i = 0; i < 8; ++i) m_pScalerBuffers3[i] = nullptr;
 }
 
 ChannelContext::~ChannelContext() {
     if (m_pAIBuffer) {
         delete[] m_pAIBuffer;
         m_pAIBuffer = nullptr;
-    }
-    if (m_pCurrentAIRCBuffer) {
-        qcap2_rcbuffer_release(m_pCurrentAIRCBuffer);
-        m_pCurrentAIRCBuffer = nullptr;
     }
     stop();
 }
@@ -111,28 +134,27 @@ bool ChannelContext::start() {
 
     qDebug() << "Starting channel" << channelId << "URL:" << url;
 
-    // Create broadcast client
-    QRESULT qres = QCAP_CREATE_BROADCAST_CLIENT(channelId, url.toLatin1().data(), &pClient, QCAP_DECODER_TYPE_ZZNVCODEC, nullptr);
+    // QCAP owns decoding and delivers its decoded SYSBUF to the decoder
+    // callback. Use zznvcodec for channels 1-24 and software from channel 25.
+    const ULONG decoderType = decoderTypeForChannel(channelId);
+    qDebug() << "CH" << channelId << "selected" << decoderName(decoderType)
+             << "decoder for the broadcast client";
+    QRESULT qres = QCAP_CREATE_BROADCAST_CLIENT(channelId, url.toLatin1().data(),
+                                                 &pClient, decoderType, nullptr,
+                                                 FALSE, FALSE);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qCritical() << "QCAP_CREATE_BROADCAST_CLIENT failed for CH" << channelId << "qres =" << qres;
         return false;
     }
 
-    // Disable client-side video decoding
-    BOOL bVideoDecode = FALSE;
-    QCAP_SET_BROADCAST_CLIENT_CUSTOM_PROPERTY_EX(pClient, QCAP_BCPROP_VIDEO_DECODE, reinterpret_cast<BYTE*>(&bVideoDecode), sizeof(bVideoDecode));
-
-    // Disable client-side audio decoding
-    BOOL bAudioDecode = FALSE;
-    QCAP_SET_BROADCAST_CLIENT_CUSTOM_PROPERTY_EX(pClient, QCAP_BCPROP_AUDIO_DECODE, reinterpret_cast<BYTE*>(&bAudioDecode), sizeof(bAudioDecode));
-
-    // Register connected and raw stream callbacks
+    // Receive QCAP-decoded SYSBUF directly; no raw stream callback and no
+    // application-created qcap2 decoder are used in this pipeline.
     QCAP_REGISTER_BROADCAST_CLIENT_CONNECTED_CALLBACK(pClient, on_connected_callback, this);
-    QCAP_REGISTER_VIDEO_BROADCAST_CLIENT_CALLBACK(pClient, on_video_callback, this);
+    QCAP_REGISTER_VIDEO_DECODER_BROADCAST_CLIENT_CALLBACK(pClient, on_decoder_video_callback, this);
     QCAP_REGISTER_BROADCAST_CLIENT_FAIL_CALLBACK(pClient, on_fail_callback, this);
 
     // Start stream receiver (TCP mode for RTSP)
-    qres = QCAP_START_BROADCAST_CLIENT(pClient, QCAP_BROADCAST_PROTOCOL_TCP, 10000, 0);
+    qres = QCAP_START_BROADCAST_CLIENT(pClient, QCAP_BROADCAST_PROTOCOL_TCP, 10000, -1);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qCritical() << "QCAP_START_BROADCAST_CLIENT failed for CH" << channelId << "qres =" << qres;
         QCAP_DESTROY_BROADCAST_CLIENT(pClient);
@@ -143,33 +165,28 @@ bool ChannelContext::start() {
     return true;
 }
 
+// Retained only as a reference while migrating from the external qcap2
+// decoder. QCAP now owns decoding and calls onDecodedVideoFrame directly.
+#if 0
 void ChannelContext::cleanupPipeline() {
     qcap2_event_handlers_t* pLocalEventHandlers = nullptr;
     qcap2_video_scaler_t* pLocalScaler2 = nullptr;
-    qcap2_video_scaler_t* pLocalScaler3 = nullptr;
     qcap2_video_decoder_t* pLocalVdec = nullptr;
     qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
     qcap2_event_t* pLocalEvent_vdec = nullptr;
     qcap2_rcbuffer_t* pLocalCurrentAIRCBuffer = nullptr;
-    qcap2_rcbuffer_t* pLocalScalerBuffers3[8] = {nullptr};
 
     {
         QMutexLocker locker(&m_mutex);
         pLocalEventHandlers = pEventHandlers;
         pLocalScaler2 = pScaler2;
-        pLocalScaler3 = pScaler3;
         pLocalVdec = pVdec;
         pLocalAIQueue = m_pAIQueue;
         pLocalEvent_vdec = pEvent_vdec;
         pLocalCurrentAIRCBuffer = m_pCurrentAIRCBuffer;
-        for (int i = 0; i < 8; ++i) {
-            pLocalScalerBuffers3[i] = m_pScalerBuffers3[i];
-            m_pScalerBuffers3[i] = nullptr;
-        }
 
         pEventHandlers = nullptr;
         pScaler2 = nullptr;
-        pScaler3 = nullptr;
         pVdec = nullptr;
         m_pAIQueue = nullptr;
         pEvent_vdec = nullptr;
@@ -206,10 +223,6 @@ void ChannelContext::cleanupPipeline() {
         qDebug() << "CH" << channelId << "cleanup: Stopping Scaler 2...";
         qcap2_video_scaler_stop(pLocalScaler2);
     }
-    if (pLocalScaler3) {
-        qDebug() << "CH" << channelId << "cleanup: Stopping Scaler 3...";
-        qcap2_video_scaler_stop(pLocalScaler3);
-    }
 
     // 5. Stop the AI Queue
     if (pLocalAIQueue) {
@@ -221,17 +234,9 @@ void ChannelContext::cleanupPipeline() {
         qcap2_rcbuffer_queue_stop(pLocalAIQueue);
     }
 
-    for (int i = 0; i < 8; ++i) {
-        if (pLocalScalerBuffers3[i]) qcap2_rcbuffer_release(pLocalScalerBuffers3[i]);
-    }
-
     if (pLocalScaler2) {
         qDebug() << "CH" << channelId << "cleanup: Deleting Scaler 2...";
         qcap2_video_scaler_delete(pLocalScaler2);
-    }
-    if (pLocalScaler3) {
-        qDebug() << "CH" << channelId << "cleanup: Deleting Scaler 3...";
-        qcap2_video_scaler_delete(pLocalScaler3);
     }
     if (pLocalAIQueue) {
         qDebug() << "CH" << channelId << "cleanup: Deleting AI Queue...";
@@ -349,7 +354,6 @@ QRETURN ChannelContext::onConnected(
 
     m_statusInfo = QString("%1x%2 @%3fps (%4)")
             .arg(nVideoWidth).arg(nVideoHeight).arg(dVideoFrameRate).arg(formatStr);
-    m_statusInfo += m_bUseGpuDecoder ? " [GPU]" : " [CPU]";
 
     qDebug() << "CH" << channelId << "Connected info:" << m_statusInfo;
 
@@ -384,9 +388,11 @@ QRETURN ChannelContext::onConnected(
     qcap2_event_get_native_handle(pEvent_vdec, &nHandle_vdec);
     qcap2_event_handlers_add_handler(pEventHandlers, nHandle_vdec, on_event_vdec_callback, this);
 
-    qDebug() << "CH" << channelId << "using"
-             << (m_bUseGpuDecoder ? "GPU (NVMMAPI/NPP)" : "CPU (software)")
-             << "decode pipeline";
+    // zznvcodec and the software decoder both produce sysbuf, so the single
+    // sysbuf scaler/display path below is shared by every RTSP channel.
+    const ULONG decoderBackend = decoderBackendForChannel(channelId);
+    qDebug() << "CH" << channelId << "starting" << decoderName(decoderTypeForChannel(channelId))
+             << "qcap2 decoder backend";
     pVdec = qcap2_video_decoder_new();
     if (!pVdec) {
         qCritical() << "CH" << channelId << "Failed to create video decoder.";
@@ -421,8 +427,7 @@ QRETURN ChannelContext::onConnected(
     qDebug() << "Trace: Setting property1 on property object...";
     qcap2_video_encoder_property_set_property1(pProp,
                                                0,
-                                               m_bUseGpuDecoder ? QCAP_ENCODER_TYPE_NVMMAPI
-                                                                : QCAP_ENCODER_TYPE_SOFTWARE,
+                                               decoderBackend,
                                                nVideoEncoderFormat,
                                                QCAP_COLORSPACE_TYPE_NV12,
                                                nVideoWidth, nVideoHeight, dVideoFrameRate,
@@ -475,9 +480,7 @@ QRETURN ChannelContext::onConnected(
     }
 
     qDebug() << "Trace: Setting video scaler 2 properties (Scaler 2)...";
-    qcap2_video_scaler_set_backend_type(
-        pScaler2, m_bUseGpuDecoder ? QCAP2_VIDEO_SCALER_BACKEND_TYPE_NPP
-                                    : QCAP2_VIDEO_SCALER_BACKEND_TYPE_DEFAULT);
+    qcap2_video_scaler_set_backend_type(pScaler2, QCAP2_VIDEO_SCALER_BACKEND_TYPE_DEFAULT);
     qcap2_video_format_t* pScalerFormat2 = qcap2_video_format_new();
     if (pScalerFormat2) {
         qcap2_video_format_set_property(pScalerFormat2, QCAP_COLORSPACE_TYPE_NV12, 640, 384, bVideoIsInterleaved, dVideoFrameRate);
@@ -486,60 +489,14 @@ QRETURN ChannelContext::onConnected(
     }
     qcap2_video_scaler_set_frame_count(pScaler2, 8);
 
-    qcap2_video_scaler_set_src_buffer_hint(pScaler2, m_bUseGpuDecoder ? QCAP2_BUFFER_HINT_CUDA
-                                                                      : QCAP2_BUFFER_HINT_DEFAULT);
-    qcap2_video_scaler_set_dst_buffer_hint(pScaler2, m_bUseGpuDecoder ? QCAP2_BUFFER_HINT_CUDA
-                                                                      : QCAP2_BUFFER_HINT_DEFAULT);
+    qcap2_video_scaler_set_src_buffer_hint(pScaler2, QCAP2_BUFFER_HINT_DEFAULT);
+    qcap2_video_scaler_set_dst_buffer_hint(pScaler2, QCAP2_BUFFER_HINT_DEFAULT); // sysbuf output
     qcap2_video_scaler_set_auto_run(pScaler2, true);
 
     qDebug() << "Trace: Starting video scaler 2 (Scaler 2)...";
     qres = qcap2_video_scaler_start(pScaler2);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qCritical() << "qcap2_video_scaler_start for Scaler 2 failed for CH" << channelId << "qres =" << qres;
-    }
-
-    // The hardware decoder and NPP scaler produce CUDA/NVBUF frames.  The
-    // QDEEP API and Qt renderer consume CPU-accessible NV12, so use a second
-    // qcap2 scaler with caller-owned system buffers (as in the traffic demo).
-    if (m_bUseGpuDecoder) {
-        pScaler3 = qcap2_video_scaler_new();
-        if (!pScaler3) {
-            qCritical() << "CH" << channelId << "Failed to create GPU-to-system scaler.";
-            m_statusInfo = "Error: Failed to create GPU-to-system scaler";
-            return QCAP_RT_OK;
-        }
-
-        qcap2_video_scaler_set_backend_type(pScaler3, QCAP2_VIDEO_SCALER_BACKEND_TYPE_NPP);
-        qcap2_video_format_t* pScalerFormat3 = qcap2_video_format_new();
-        if (pScalerFormat3) {
-            qcap2_video_format_set_property(pScalerFormat3, QCAP_COLORSPACE_TYPE_NV12,
-                                             640, 384, bVideoIsInterleaved, dVideoFrameRate);
-            qcap2_video_scaler_set_video_format(pScaler3, pScalerFormat3);
-            qcap2_video_format_delete(pScalerFormat3);
-        }
-        qcap2_video_scaler_set_frame_count(pScaler3, 8);
-        for (int i = 0; i < 8; ++i) {
-            m_pScalerBuffers3[i] = qcap2_rcbuffer_new_av_frame();
-            if (!m_pScalerBuffers3[i]) continue;
-            qcap2_av_frame_t* pAVFrame = static_cast<qcap2_av_frame_t*>(
-                qcap2_rcbuffer_lock_data(m_pScalerBuffers3[i]));
-            if (pAVFrame) {
-                qcap2_av_frame_set_video_property(pAVFrame, QCAP_COLORSPACE_TYPE_NV12, 640, 384);
-                if (!qcap2_av_frame_alloc_buffer(pAVFrame, 32, 1)) {
-                    qCritical() << "CH" << channelId << "Failed to allocate GPU-to-system buffer" << i;
-                }
-                qcap2_rcbuffer_unlock_data(m_pScalerBuffers3[i]);
-            }
-        }
-        qcap2_video_scaler_set_buffers(pScaler3, &m_pScalerBuffers3[0]);
-        qcap2_video_scaler_set_src_buffer_hint(pScaler3, QCAP2_BUFFER_HINT_CUDA);
-        qcap2_video_scaler_set_dst_buffer_hint(pScaler3, QCAP2_BUFFER_HINT_DEFAULT);
-        qcap2_video_scaler_set_auto_run(pScaler3, true);
-        qres = qcap2_video_scaler_start(pScaler3);
-        if (qres != QCAP_RS_SUCCESSFUL) {
-            qCritical() << "qcap2_video_scaler_start for GPU-to-system scaler failed for CH"
-                        << channelId << "qres =" << qres;
-        }
     }
 
     // ── Create AI Queue ────────────────────────────────────────────────
@@ -596,8 +553,6 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
 QRETURN ChannelContext::onEventVdec() {
     qcap2_video_decoder_t* pLocalVdec = nullptr;
     qcap2_video_scaler_t* pLocalScaler2 = nullptr;
-    qcap2_video_scaler_t* pLocalScaler3 = nullptr;
-    bool bUseGpuDecoder = false;
     bool bDisplayEnabled = false;
     bool bSendBuffer = false;
     double dSourceFrameRate = DEFAULT_AI_TARGET_FPS;
@@ -608,8 +563,6 @@ QRETURN ChannelContext::onEventVdec() {
         if (!pVdec) return QCAP_RT_OK;
         pLocalVdec = pVdec;
         pLocalScaler2 = pScaler2;
-        pLocalScaler3 = pScaler3;
-        bUseGpuDecoder = m_bUseGpuDecoder;
         bDisplayEnabled = m_bDisplayEnabled;
         bSendBuffer = m_bSendBuffer;
         dSourceFrameRate = m_dVideoFrameRate;
@@ -643,19 +596,6 @@ QRETURN ChannelContext::onEventVdec() {
             }
         } else {
             qDebug() << "Trace: onEventVdec - scaler push failed, qres=" << qres;
-        }
-    }
-
-    if (bUseGpuDecoder && pScaledBuffer) {
-        qcap2_rcbuffer_t* pSysBuffer = nullptr;
-        if (pLocalScaler3 &&
-            qcap2_video_scaler_push(pLocalScaler3, pScaledBuffer) == QCAP_RS_SUCCESSFUL &&
-            qcap2_video_scaler_pop(pLocalScaler3, &pSysBuffer) == QCAP_RS_SUCCESSFUL && pSysBuffer) {
-            qcap2_rcbuffer_release(pScaledBuffer);
-            pScaledBuffer = pSysBuffer;
-        } else {
-            qcap2_rcbuffer_release(pScaledBuffer);
-            pScaledBuffer = nullptr;
         }
     }
 
@@ -831,6 +771,258 @@ QRETURN ChannelContext::onEventVdec() {
 }
 
 
+#endif
+
+void ChannelContext::cleanupPipeline()
+{
+    qcap2_video_scaler_t* pLocalScaler = nullptr;
+    qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
+    {
+        QMutexLocker locker(&m_mutex);
+        pLocalScaler = pScaler2;
+        pLocalAIQueue = m_pAIQueue;
+        pScaler2 = nullptr;
+        m_pAIQueue = nullptr;
+    }
+
+    if (pLocalScaler) {
+        qcap2_video_scaler_stop(pLocalScaler);
+        qcap2_video_scaler_delete(pLocalScaler);
+    }
+    if (pLocalAIQueue) {
+        qcap2_rcbuffer_t* pBuffer = nullptr;
+        while (qcap2_rcbuffer_queue_pop(pLocalAIQueue, &pBuffer) == QCAP_RS_SUCCESSFUL && pBuffer) {
+            qcap2_rcbuffer_release(pBuffer);
+        }
+        qcap2_rcbuffer_queue_stop(pLocalAIQueue);
+        qcap2_rcbuffer_queue_delete(pLocalAIQueue);
+    }
+}
+
+void ChannelContext::stop()
+{
+    PVOID pLocalClient = nullptr;
+    {
+        QMutexLocker locker(&m_mutex);
+        pLocalClient = pClient;
+        pClient = nullptr;
+    }
+    if (pLocalClient) QCAP_STOP_BROADCAST_CLIENT(pLocalClient);
+    cleanupPipeline();
+    if (pLocalClient) QCAP_DESTROY_BROADCAST_CLIENT(pLocalClient);
+}
+
+QRETURN ChannelContext::onFail(UINT iSessionNum, QRESULT nErrorStatus, DWORD nErrorCode)
+{
+    Q_UNUSED(iSessionNum);
+    QMutexLocker locker(&m_mutex);
+    qCritical() << "CH" << channelId << "Broadcast client failure callback! Status:"
+                << nErrorStatus << "Code:" << nErrorCode;
+    m_statusInfo = QString("Disconnected (Error 0x%1)").arg(nErrorStatus, 8, 16, QChar('0'));
+    return QCAP_RT_OK;
+}
+
+void ChannelContext::setDisplayEnabled(bool enabled)
+{
+    QMutexLocker locker(&m_mutex);
+    m_bDisplayEnabled = enabled;
+}
+
+QRETURN ChannelContext::onConnected(
+        PVOID pClient, UINT iSessionNum, ULONG nVideoEncoderFormat,
+        ULONG nVideoWidth, ULONG nVideoHeight, BOOL bVideoIsInterleaved,
+        double dVideoFrameRate)
+{
+    Q_UNUSED(pClient);
+    Q_UNUSED(iSessionNum);
+
+    bool needCleanup = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        needCleanup = pScaler2 || m_pAIQueue;
+    }
+    if (needCleanup) cleanupPipeline();
+
+    QMutexLocker locker(&m_mutex);
+    if (nVideoWidth == 0 || nVideoHeight == 0 || nVideoWidth > 8192 || nVideoHeight > 8192) {
+        qCritical() << "CH" << channelId << "Connected with unreasonable dimensions:"
+                    << nVideoWidth << "x" << nVideoHeight;
+        m_statusInfo = QString("Aborted (unreasonable dimensions: %1x%2)")
+                           .arg(nVideoWidth).arg(nVideoHeight);
+        return QCAP_RT_OK;
+    }
+
+    m_nVideoWidth = nVideoWidth;
+    m_nVideoHeight = nVideoHeight;
+    m_dVideoFrameRate = dVideoFrameRate;
+    m_nVideoEncoderFormat = nVideoEncoderFormat;
+    m_nAIWidth = 640;
+    m_nAIHeight = 384;
+    m_nAIBufferLen = m_nAIWidth * m_nAIHeight * 3 / 2;
+
+    qcap2_video_scaler_t* scaler = qcap2_video_scaler_new();
+    qcap2_video_format_t* scalerFormat = scaler ? qcap2_video_format_new() : nullptr;
+    if (!scaler || !scalerFormat) {
+        if (scalerFormat) qcap2_video_format_delete(scalerFormat);
+        if (scaler) qcap2_video_scaler_delete(scaler);
+        qCritical() << "CH" << channelId << "cannot create SYSBUF downscaler";
+        m_statusInfo = QStringLiteral("Downscaler creation failed");
+        return QCAP_RT_OK;
+    }
+    qcap2_video_scaler_set_backend_type(scaler, QCAP2_VIDEO_SCALER_BACKEND_TYPE_DEFAULT);
+    qcap2_video_format_set_property(scalerFormat, QCAP_COLORSPACE_TYPE_NV12,
+                                    m_nAIWidth, m_nAIHeight,
+                                    bVideoIsInterleaved, dVideoFrameRate);
+    qcap2_video_scaler_set_video_format(scaler, scalerFormat);
+    qcap2_video_format_delete(scalerFormat);
+    qcap2_video_scaler_set_frame_count(scaler, 8);
+    qcap2_video_scaler_set_src_buffer_hint(scaler, QCAP2_BUFFER_HINT_DEFAULT);
+    qcap2_video_scaler_set_dst_buffer_hint(scaler, QCAP2_BUFFER_HINT_DEFAULT);
+    qcap2_video_scaler_set_auto_run(scaler, true);
+    const QRESULT scalerResult = qcap2_video_scaler_start(scaler);
+    if (scalerResult != QCAP_RS_SUCCESSFUL) {
+        qcap2_video_scaler_delete(scaler);
+        qCritical() << "CH" << channelId << "cannot start SYSBUF downscaler:" << scalerResult;
+        m_statusInfo = QString("Downscaler start failed (%1)").arg(scalerResult);
+        return QCAP_RT_OK;
+    }
+    pScaler2 = scaler;
+
+    m_pAIQueue = qcap2_rcbuffer_queue_new();
+    if (m_pAIQueue) {
+        qcap2_rcbuffer_queue_set_max_buffers(m_pAIQueue, 3);
+        qcap2_rcbuffer_queue_start(m_pAIQueue);
+    } else {
+        qWarning() << "CH" << channelId << "cannot create AI queue";
+    }
+
+    QString formatStr;
+    switch (nVideoEncoderFormat) {
+    case QCAP_ENCODER_FORMAT_H264: formatStr = "H.264"; break;
+    case QCAP_ENCODER_FORMAT_H265: formatStr = "H.265"; break;
+    case QCAP_ENCODER_FORMAT_AV1: formatStr = "AV1"; break;
+    default: formatStr = QString("Unknown (%1)").arg(nVideoEncoderFormat); break;
+    }
+    m_statusInfo = QString("%1x%2 @%3fps (%4), downscale %5x%6")
+            .arg(nVideoWidth).arg(nVideoHeight).arg(dVideoFrameRate).arg(formatStr)
+            .arg(m_nAIWidth).arg(m_nAIHeight);
+    return QCAP_RT_OK;
+}
+
+QRETURN ChannelContext::onDecodedVideoFrame(
+        double dSampleTime, BYTE* pFrameBuffer, ULONG nFrameBufferLen)
+{
+    Q_UNUSED(dSampleTime);
+    qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
+    bool bDisplayEnabled = false;
+    bool bSendBuffer = false;
+    double dSourceFrameRate = DEFAULT_AI_TARGET_FPS;
+    {
+        QMutexLocker locker(&m_mutex);
+        if (!pClient || !pScaler2) return QCAP_RT_OK;
+        pLocalAIQueue = m_pAIQueue;
+        bDisplayEnabled = m_bDisplayEnabled;
+        bSendBuffer = m_bSendBuffer;
+        dSourceFrameRate = m_dVideoFrameRate;
+    }
+
+    // The decoder callback SYSBUF is owned by QCAP. It is only used as input
+    // to the downscaler during this callback and is never released here.
+    qcap2_rcbuffer_t* pQcapFrame = qcap2_rcbuffer_cast(pFrameBuffer, nFrameBufferLen);
+    if (!pQcapFrame) return QCAP_RT_OK;
+
+    qcap2_rcbuffer_t* pScaledBuffer = nullptr;
+    QRESULT qres = QCAP_RS_ERROR_GENERAL;
+    // Keep the downscaler alive across push/pop. stop() and reconnect take
+    // this same lock before stopping or deleting it.
+    {
+        QMutexLocker scalerLocker(&m_mutex);
+        if (pClient && pScaler2) {
+            qres = qcap2_video_scaler_push(pScaler2, pQcapFrame);
+            if (qres == QCAP_RS_SUCCESSFUL)
+                qres = qcap2_video_scaler_pop(pScaler2, &pScaledBuffer);
+        }
+    }
+    if (qres != QCAP_RS_SUCCESSFUL || !pScaledBuffer) {
+        qWarning() << "[SYSBUF downscaler] CH" << channelId << "push/pop failed:" << qres;
+        return QCAP_RT_OK;
+    }
+
+    if (bSendBuffer && g_pMainwindow && g_pMainwindow->ai_running && pLocalAIQueue) {
+        const double targetFps = dSourceFrameRate > 0.0 ? dSourceFrameRate : DEFAULT_AI_TARGET_FPS;
+        const double currentTime = QCAP_GET_TIME();
+        if ((currentTime - m_lastProcessTime) >= 1.0 / targetFps) {
+            m_lastProcessTime = currentTime;
+            if (qcap2_rcbuffer_queue_is_full(pLocalAIQueue)) {
+                qcap2_rcbuffer_t* pOld = nullptr;
+                if (qcap2_rcbuffer_queue_pop(pLocalAIQueue, &pOld) == QCAP_RS_SUCCESSFUL && pOld)
+                    qcap2_rcbuffer_release(pOld);
+            }
+            if (qcap2_rcbuffer_queue_push(pLocalAIQueue, pScaledBuffer) == QCAP_RS_SUCCESSFUL)
+                g_pMainwindow->cv.notify_one();
+        }
+    }
+
+    bool skipDisplay = false;
+    if (bDisplayEnabled && g_pMainwindow && g_pMainwindow->m_bHalfRefreshRate)
+        skipDisplay = m_displayFrameCount.fetch_add(1) % 2 != 0;
+    if (bDisplayEnabled && !skipDisplay && m_pLabel && m_pPendingUpdate && !m_pPendingUpdate->exchange(true)) {
+        PVOID pLockedData = qcap2_rcbuffer_lock_data(pScaledBuffer);
+        if (pLockedData) {
+            qcap2_av_frame_t* pAVFrame = reinterpret_cast<qcap2_av_frame_t*>(pLockedData);
+            uint8_t* pBuffer[4] = {nullptr};
+            int pStride[4] = {0};
+            qcap2_av_frame_get_buffer1(pAVFrame, pBuffer, pStride);
+            if (pBuffer[0] && pBuffer[1] && pStride[0] > 0 && pStride[1] > 0) {
+                const int copyWidth = m_nAIWidth;
+                const int copyHeight = m_nAIHeight;
+                std::vector<BYTE> nv12(copyWidth * copyHeight * 3 / 2);
+                for (int row = 0; row < copyHeight; ++row)
+                    memcpy(nv12.data() + row * copyWidth, pBuffer[0] + row * pStride[0], copyWidth);
+                BYTE* pDstUV = nv12.data() + copyWidth * copyHeight;
+                for (int row = 0; row < copyHeight / 2; ++row)
+                    memcpy(pDstUV + row * copyWidth, pBuffer[1] + row * pStride[1], copyWidth);
+                cv::Mat nv12Mat(copyHeight * 3 / 2, copyWidth, CV_8UC1, nv12.data());
+                cv::Mat bgrMat;
+                cv::cvtColor(nv12Mat, bgrMat, cv::COLOR_YUV2BGR_NV12);
+                if (g_pMainwindow && g_pMainwindow->m_bShowOverlay) {
+                    std::vector<DrawBox> boxes;
+                    {
+                        std::lock_guard<std::mutex> drawLocker(g_pMainwindow->draw_mtx);
+                        boxes = g_pMainwindow->draw_boxes[channelId];
+                    }
+                    for (const DrawBox& box : boxes) {
+                        cv::rectangle(bgrMat, cv::Rect(box.x, box.y, box.width, box.height),
+                                      cv::Scalar(0, 255, 0), 2);
+                    }
+                }
+                cv::putText(bgrMat, "CH " + std::to_string(channelId + 1), cv::Point(10, 25),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
+                QImage qimg = cvMatToQImage(bgrMat);
+                QPointer<QLabel> safeLabel = m_pLabel;
+                std::shared_ptr<std::atomic<bool>> pending = m_pPendingUpdate;
+                QMetaObject::invokeMethod(m_pLabel, [safeLabel, qimg, pending]() {
+                    if (safeLabel) safeLabel->setPixmap(QPixmap::fromImage(qimg));
+                    if (pending) pending->store(false);
+                }, Qt::QueuedConnection);
+            } else {
+                m_pPendingUpdate->store(false);
+            }
+            qcap2_rcbuffer_unlock_data(pScaledBuffer);
+        } else {
+            m_pPendingUpdate->store(false);
+        }
+    }
+
+    qcap2_rcbuffer_release(pScaledBuffer);
+    if (!m_fpsTimer.isValid()) m_fpsTimer.start();
+    ++m_decFrameCount;
+    if (m_fpsTimer.elapsed() >= 2000) { m_decFrameCount = 0; m_fpsTimer.restart(); }
+    QMutexLocker locker(&m_mutex);
+    ++m_frameCount;
+    return QCAP_RT_OK;
+}
+
 // ── MainWindow Implementation ───────────────────────────────────────────────
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), m_bFullscreen(false),
@@ -963,7 +1155,7 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.191.6:1554/session0.mpg"));
+            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.190.70:554/session0.mpg"));
         }
     }
 }
@@ -974,10 +1166,6 @@ void MainWindow::onBtnStartClicked()
     clearGrid();
 
     int count = spinChannelCount->value();
-    // NVMMAPI is used for up to 32 inputs.  This yields all-GPU decoding for
-    // 1..32 channels, and the requested 32 GPU + 32 CPU split at 64 channels.
-    const int gpuChannelCount = qMin(count, 32);
-    const int cpuChannelCount = count - gpuChannelCount;
     int cols = 2;
     if (m_bFullscreen) {
         if (count >= 17) {
@@ -1015,8 +1203,7 @@ void MainWindow::onBtnStartClicked()
         frame->show();
 
         QString url = tableUrls->item(i, 1)->text().trimmed();
-        const bool useGpuDecoder = i < gpuChannelCount;
-        ChannelContext *ctx = new ChannelContext(i, url, label, useGpuDecoder);
+        ChannelContext *ctx = new ChannelContext(i, url, label);
         ctx->setDisplayEnabled(m_bEnableDisplay);
         channels.append(ctx);
 
@@ -1027,8 +1214,7 @@ void MainWindow::onBtnStartClicked()
     tableUrls->setEnabled(false);
     btnStart->setEnabled(false);
     btnStop->setEnabled(true);
-    lblStatus->setText(QString("Status: Running (%1 GPU, %2 CPU decode)")
-                       .arg(gpuChannelCount).arg(cpuChannelCount));
+    lblStatus->setText("Status: Running");
 
     // Start AI inference only when the UI option is enabled.
     if (chkEnableQdeepInference->isChecked()) {
@@ -1178,16 +1364,16 @@ void MainWindow::init_models()
         buffer_len_vec[i] = MAX_BUFFER_SIZE;
     }
 
-    // QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-    //     QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-    //     QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-    //     (char*)"/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/model/tw/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG",
-    //     &handle, flag, MAX_BATCH);
-
+    const QByteArray modelPath = trafficModelPath().toLocal8Bit();
+    if (!QFileInfo::exists(QString::fromLocal8Bit(modelPath))) {
+        qCritical() << "[AI Log] Traffic model configuration not found:" << modelPath
+                    << "(set QDEEP_TRAFFIC_MODEL to override it)";
+        return;
+    }
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
         QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
         QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-        (char*)"/home/nvidia/qdeep/demo/model/traffic_Batch64/QDEEP.OD.TAIWAN.TRAFFIC.C4.TINY.CFG",
+        const_cast<CHAR*>(modelPath.constData()),
         &handle, flag, MAX_BATCH);
 
 

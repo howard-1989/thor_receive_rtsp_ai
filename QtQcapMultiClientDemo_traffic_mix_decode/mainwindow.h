@@ -56,17 +56,7 @@ struct ChannelContext {
     QLabel* m_pLabel;
 
     PVOID pClient;
-    qcap2_video_decoder_t* pVdec;
-    qcap2_event_handlers_t* pEventHandlers;
-    qcap2_event_t* pEvent_vdec;
-    // CPU: pScaler2 converts decoded sysbuf directly to AI/display sysbuf.
-    // GPU: pScaler2 is NPP (decoded nvbuf -> 640x384 nvbuf), pScaler3
-    //       copies that result to 640x384 sysbuf for QDEEP and rendering.
     qcap2_video_scaler_t* pScaler2;
-    qcap2_video_scaler_t* pScaler3;
-    qcap2_rcbuffer_t* m_pScalerBuffers3[8];
-    bool m_bUseGpuDecoder;
-    qcap2_rcbuffer_t* m_pCurrentAIRCBuffer;
     qcap2_rcbuffer_queue_t* m_pAIQueue;      // AI frame queue for pipeline optimization
 
     // Connected format properties
@@ -100,7 +90,7 @@ struct ChannelContext {
     int m_nAIWidth;             // Width for AI processing
     int m_nAIHeight;            // Height for AI processing
 
-    ChannelContext(int id, const QString& streamUrl, QLabel* pLabel, bool useGpuDecoder);
+    ChannelContext(int id, const QString& streamUrl, QLabel* pLabel);
     ~ChannelContext();
 
     bool start();
@@ -109,9 +99,8 @@ struct ChannelContext {
     void setDisplayEnabled(bool enabled);
 
     QRETURN onConnected(PVOID pClient, UINT iSessionNum, ULONG nVideoEncoderFormat, ULONG nVideoWidth, ULONG nVideoHeight, BOOL bVideoIsInterleaved, double dVideoFrameRate);
-    QRETURN onVideoCallback(double dSampleTime, BYTE * pStreamBuffer, ULONG nStreamBufferLen, BOOL bIsKeyFrame);
+    QRETURN onDecodedVideoFrame(double dSampleTime, BYTE * pFrameBuffer, ULONG nFrameBufferLen);
     QRETURN onFail(UINT iSessionNum, QRESULT nErrorStatus, DWORD nErrorCode);
-    QRETURN onEventVdec();
 };
 
 class MainWindow : public QMainWindow
