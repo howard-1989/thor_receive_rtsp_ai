@@ -27,7 +27,6 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
-#include <condition_variable>
 #include <chrono>
 #include <memory>
 
@@ -36,19 +35,9 @@ namespace QDEEP_API {
 }
 
 // ── AI Constants ────────────────────────────────────────────────────────────
-#define BOX_SIZE 100
-#define MAX_BATCH 64
+#define BOX_SIZE 1
 #define MAX_BUFFER_SIZE (1920 * 1080 * 3 / 2)
-#define DEFAULT_AI_TARGET_FPS 30.0
-
-struct DrawBox {
-    int x;
-    int y;
-    int width;
-    int height;
-    float probability;
-    int classID;
-};
+#define DEFAULT_AI_TARGET_FPS 15.0
 
 struct ChannelContext {
     int channelId;
@@ -59,13 +48,7 @@ struct ChannelContext {
     qcap2_video_decoder_t* pVdec;
     qcap2_event_handlers_t* pEventHandlers;
     qcap2_event_t* pEvent_vdec;
-    // CPU: pScaler2 converts decoded sysbuf directly to AI/display sysbuf.
-    // GPU: pScaler2 is NPP (decoded nvbuf -> 640x384 nvbuf), pScaler3
-    //       copies that result to 640x384 sysbuf for QDEEP and rendering.
     qcap2_video_scaler_t* pScaler2;
-    qcap2_video_scaler_t* pScaler3;
-    qcap2_rcbuffer_t* m_pScalerBuffers3[8];
-    bool m_bUseGpuDecoder;
     qcap2_rcbuffer_t* m_pCurrentAIRCBuffer;
     qcap2_rcbuffer_queue_t* m_pAIQueue;      // AI frame queue for pipeline optimization
 
@@ -100,7 +83,7 @@ struct ChannelContext {
     int m_nAIWidth;             // Width for AI processing
     int m_nAIHeight;            // Height for AI processing
 
-    ChannelContext(int id, const QString& streamUrl, QLabel* pLabel, bool useGpuDecoder);
+    ChannelContext(int id, const QString& streamUrl, QLabel* pLabel);
     ~ChannelContext();
 
     bool start();
@@ -147,7 +130,9 @@ public:
     static const int MAX_CHANNELS = 64;
 
 public:
-    void* handle;
+    PVOID channelHandle[MAX_CHANNELS];
+    float channelModelVersion[MAX_CHANNELS];
+    QVector<QString> captions;
     std::vector<ULONG> color_space;
     std::vector<ULONG> width_vec;
     std::vector<ULONG> height_vec;
@@ -155,16 +140,11 @@ public:
     std::vector<ULONG> buffer_len_vec;
     std::vector<ULONG> box_size_vec;
     std::vector<QDEEP_API::QDEEP_OBJECT_DETECT_BOUNDING_BOX*> box_list_vec;
-    DWORD flag;
 
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool ai_running;
-    std::thread* pAiThread;
-    int ready_count;
+    std::atomic<bool> ai_running;
+    std::thread* channelAiThread[MAX_CHANNELS];
     int active_camera_count;
 
-    std::vector<DrawBox> draw_boxes[MAX_BATCH];
     std::mutex draw_mtx;
 
 private:
@@ -174,10 +154,12 @@ private:
     // ── AI Functions ─────────────────────────────────────────────────────
     void init_models();
     void uninit_models();
+    bool createCaptionHandle(int channelId);
+    void destroyCaptionHandles();
     void yolo_start();
     void yolo_stop();
     void discardQueuedAIFrames();
-    void ai_inference_thread();
+    void ai_inference_thread(int channelId);
 
     // UI elements
     QWidget *centralWidget;

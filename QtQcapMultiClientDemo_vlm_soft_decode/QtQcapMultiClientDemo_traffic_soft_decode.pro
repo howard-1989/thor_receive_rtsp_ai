@@ -2,7 +2,7 @@ QT       += core gui
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
-TARGET = QtQcapMultiClientDemo_traffic_mix
+TARGET = QtQcapMultiClientDemo_vlm_soft_decode
 TEMPLATE = app
 
 CONFIG += c++11
