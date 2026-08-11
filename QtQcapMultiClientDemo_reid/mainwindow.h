@@ -37,10 +37,17 @@ namespace QDEEP_API {
 
 // ── AI Constants ────────────────────────────────────────────────────────────
 #define BOX_SIZE 100
-#define MAX_BATCH 16
+#define MAX_BATCH 64
 #define MAX_BUFFER_SIZE (1920 * 1080 * 3 / 2)
-#define TARGET_FPS 15.0
-#define FRAME_INTERVAL (1.0 / TARGET_FPS)
+#define DEFAULT_AI_TARGET_FPS 30.0
+
+struct DrawBox {
+    int x;
+    int y;
+    int width;
+    int height;
+    float probability;
+};
 
 struct ChannelContext {
     int channelId;
@@ -150,6 +157,9 @@ public:
     std::thread* pAiThread;
     int ready_count;
     int active_camera_count;
+
+    std::vector<DrawBox> draw_boxes[MAX_BATCH];
+    std::mutex draw_mtx;
 
 private:
     void clearGrid();

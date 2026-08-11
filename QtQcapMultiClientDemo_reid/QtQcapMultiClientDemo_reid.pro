@@ -2,7 +2,7 @@ QT       += core gui
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
-TARGET = QtQcapMultiClientDemo_people_soft_decode
+TARGET = QtQcapMultiClientDemo_reid
 TEMPLATE = app
 
 CONFIG += c++11
@@ -25,7 +25,7 @@ INCLUDEPATH += \
 QMAKE_LFLAGS += -Wl,-rpath,$$PWD/../lib \
                 -Wl,-rpath,$$PWD/../qdeep/lib
 
-LIBS += -L$$PWD/../lib -lqcap -lqcap2_rcbuffer -L$$PWD/../qdeep/lib -lQDEEP
+LIBS += -L$$PWD/../lib -lqcap -lqcap2_rcbuffer -lQDEEP
 
 CONFIG += link_pkgconfig
 PKGCONFIG += opencv4

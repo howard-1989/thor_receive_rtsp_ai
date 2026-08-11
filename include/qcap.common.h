@@ -280,6 +280,7 @@ enum {
 	QCAP_DEVPROP_NVT_HDAL_VOUT_WIDTH,				// [in, ULONG] video output width
 	QCAP_DEVPROP_NVT_HDAL_VOUT_HEIGHT,				// [in, ULONG] video output height
 	QCAP_DEVPROP_NVT_HDAL_VOUT_FRAME_RATE,			// [in, DOUBLE] video output height
+	QCAP_DEVPROP_Y210_REDUCED_MODE,					// [in, ULONG] 0:disable, 1:enable
 
 	// for hisiv_base
 	QCAP_DEVPROP_LINEIN_SOURCE = 20000,				// in,out: ULONG
@@ -719,17 +720,83 @@ QCAP_EXT_API QRESULT QCAP_EXPORT QCAP_COLORSPACE_YUY2_TO_UYVY(   BYTE * pSrcFram
 QCAP_EXT_API QRESULT QCAP_EXPORT QCAP_COLORSPACE_YV12_TO_UYVY(   BYTE * pSrcFrameBuffer, ULONG nSrcWidth, ULONG nSrcHeight, ULONG nSrcPitch, BYTE * pDstFrameBuffer, ULONG nDstWidth, ULONG nDstHeight, ULONG nDstPitch, BOOL bHorizontalMirror, BOOL bVerticalMirror );
 QCAP_EXT_API QRESULT QCAP_EXPORT QCAP_COLORSPACE_NV12_TO_UYVY(   BYTE * pSrcFrameBuffer, ULONG nSrcWidth, ULONG nSrcHeight, ULONG nSrcPitch, BYTE * pDstFrameBuffer, ULONG nDstWidth, ULONG nDstHeight, ULONG nDstPitch, BOOL bHorizontalMirror, BOOL bVerticalMirror );
 QCAP_EXT_API QRESULT QCAP_EXPORT QCAP_COLORSPACE_CONVERT(ULONG nSrcColorSpaceType, BYTE * pSrcFrameBuffer, ULONG nSrcWidth, ULONG nSrcHeight, ULONG nSrcPitch, ULONG nDstColorSpaceType, BYTE * pDstFrameBuffer, ULONG nDstWidth, ULONG nDstHeight, ULONG nDstPitch, BOOL bHorizontalMirror, BOOL bVerticalMirror );
+/*
+ * @brief Crops a video frame.
+ * @param[in] pSrcFrameBuffer Source frame buffer (RC-only, must be a valid refcounted buffer pointer).
+ * @param[in] nSrcFrameBufferLen Length/TAG of source buffer (must be ZzRefCountedBuffer::TAG (0xFFFFCAFE)).
+ * @param[in] nCropX X coordinate of crop rectangle.
+ * @param[in] nCropY Y coordinate of crop rectangle.
+ * @param[in] nCropW Width of crop rectangle.
+ * @param[in] nCropH Height of crop rectangle.
+ * @param[out] pDstFrameBuffer Destination frame buffer (RC-only, must be a valid refcounted buffer pointer).
+ * @param[in] nDstFrameBufferLen Length/TAG of destination buffer (must be ZzRefCountedBuffer::TAG (0xFFFFCAFE)).
+ */
 QCAP_EXT_API QRESULT QCAP_EXPORT QCAP_CROP_VIDEO_FRAME( BYTE* pSrcFrameBuffer, ULONG nSrcFrameBufferLen, ULONG nCropX, ULONG nCropY, ULONG nCropW, ULONG nCropH, BYTE* pDstFrameBuffer, ULONG nDstFrameBufferLen );
+
+/*
+ * @brief Allocates a new reference-counted buffer handle (AVFrameRCBuffer).
+ * @param[out] ppBuffer Pointer to the allocated buffer handle, cast as BYTE*.
+ * @param[out] pBufferLen Set to ZzRefCountedBuffer::TAG (0xFFFFCAFE).
+ * @note The caller takes ownership of the returned reference and must call
+ *       QCAP_DESTROY_BUFFER or QCAP_BUFFER_RELEASE when done.
+ */
 QCAP_EXT_API QRESULT QCAP_EXPORT QCAP_CREATE_BUFFER( BYTE** ppBuffer, ULONG* pBufferLen );
+
+/*
+ * @brief Releases the caller's reference on a reference-counted buffer handle.
+ * @param[in] pBuffer The buffer handle pointer.
+ * @param[in] nBufferLen Must be ZzRefCountedBuffer::TAG (0xFFFFCAFE).
+ */
 QCAP_EXT_API QRESULT QCAP_EXPORT QCAP_DESTROY_BUFFER( BYTE* pBuffer, ULONG nBufferLen );
 
-// reference counted buffer
+/* reference counted buffer */
+
+/*
+ * @brief Casts and retrieves the internal refcounted buffer object from a (BYTE*, ULONG) pair.
+ * @param[in] pBuffer The buffer handle pointer.
+ * @param[in] nBufferLen Must be ZzRefCountedBuffer::TAG (0xFFFFCAFE) to identify a refcounted buffer.
+ * @return The internal refcounted buffer object pointer (PVOID), or NULL if invalid or raw data.
+ */
 QCAP_EXT_API PVOID QCAP_EXPORT QCAP_BUFFER_GET_RCBUFFER( BYTE * pBuffer, ULONG nBufferLen );
+
+/*
+ * @brief Locks the memory data of the refcounted buffer for reading or writing.
+ * @param[in] pRCBuffer The internal refcounted buffer object pointer.
+ * @return Pointer to the locked media frame data (QCAP_AV_FRAME or QCAP_AV_PACKET).
+ * @note Every successful lock must have a corresponding unlock.
+ */
 QCAP_EXT_API PVOID QCAP_EXPORT QCAP_RCBUFFER_LOCK_DATA( PVOID pRCBuffer );
+
+/*
+ * @brief Unlocks the memory data of the refcounted buffer.
+ * @param[in] pRCBuffer The internal refcounted buffer object pointer.
+ */
 QCAP_EXT_API void QCAP_EXPORT QCAP_RCBUFFER_UNLOCK_DATA( PVOID pRCBuffer );
+
+/*
+ * @brief Adds a weak reference to the internal refcounted buffer object.
+ * @param[in] pRCBuffer The internal refcounted buffer object pointer.
+ */
 QCAP_EXT_API void QCAP_EXPORT QCAP_RCBUFFER_ADD_REF( PVOID pRCBuffer );
+
+/*
+ * @brief Releases a weak reference on the internal refcounted buffer object.
+ * @param[in] pRCBuffer The internal refcounted buffer object pointer.
+ */
 QCAP_EXT_API void QCAP_EXPORT QCAP_RCBUFFER_RELEASE( PVOID pRCBuffer );
+
+/*
+ * @brief Allocates a new reference-counted video/audio frame buffer handle.
+ * @param[out] ppBuffer Pointer to the allocated buffer handle, cast as BYTE*.
+ * @param[out] pBufferLen Set to ZzRefCountedBuffer::TAG (0xFFFFCAFE).
+ */
 QCAP_EXT_API QRESULT QCAP_EXPORT QCAP_CREATE_FRAME_BUFFER( BYTE** ppBuffer, ULONG* pBufferLen );
+
+/*
+ * @brief Releases the caller's reference on a reference-counted frame buffer handle.
+ * @param[in] pBuffer The buffer handle pointer.
+ * @param[in] nBufferLen Must be ZzRefCountedBuffer::TAG (0xFFFFCAFE).
+ */
 QCAP_EXT_API QRESULT QCAP_EXPORT QCAP_DESOTRY_FRAME_BUFFER( BYTE * pBuffer, ULONG nBufferLen );
 
 // code-block lock
