@@ -329,17 +329,86 @@ int qcap2_debug_fetch_add(int n, int v);
 int qcap2_debug_fetch_sub(int n, int v);
 
 // qcap2_rcbuffer_t
+
+/*
+ * @brief Allocates a new typed refcounted buffer wrapping raw media data.
+ * @param[in] pData Pointer to the raw data (usually qcap2_av_frame_t or qcap2_av_packet_t).
+ * @param[in] pOnFreeResource Callback invoked when the refcount drops to 0 to free the raw data.
+ * @return Pointer to the allocated qcap2_rcbuffer_t wrapper.
+ */
 qcap2_rcbuffer_t* qcap2_rcbuffer_new(PVOID pData, qcap2_on_free_resource_t pOnFreeResource);
+
+/*
+ * @brief Deletes the refcounted buffer wrapper, freeing resources if the refcount reaches 0.
+ * @param[in] pRCBuffer The refcounted buffer pointer.
+ */
 void qcap2_rcbuffer_delete(qcap2_rcbuffer_t* pRCBuffer);
+
+/*
+ * @brief Exports the typed refcounted buffer handle to a legacy (BYTE*, ULONG) handle pair.
+ * @param[in] pRCBuffer The refcounted buffer pointer.
+ * @param[out] ppBuffer Pointer to retrieve the casted buffer pointer.
+ * @param[out] pBufferSize Pointer to retrieve the length/TAG (set to 0xFFFFCAFE).
+ */
 void qcap2_rcbuffer_to_buffer(qcap2_rcbuffer_t* pRCBuffer, BYTE** ppBuffer, ULONG* pBufferSize);
+
+/*
+ * @brief Casts a legacy (BYTE*, ULONG) handle pair back to a typed refcounted buffer handle.
+ * @param[in] pBuffer The legacy buffer pointer.
+ * @param[in] nBufferLen Must be ZzRefCountedBuffer::TAG (0xFFFFCAFE).
+ * @return Pointer to the qcap2_rcbuffer_t wrapper, or NULL if invalid.
+ */
 qcap2_rcbuffer_t* qcap2_rcbuffer_cast(BYTE * pBuffer, ULONG nBufferLen);
+
+/*
+ * @brief Increments the strong refcount of the refcounted buffer.
+ * @param[in] pRCBuffer The refcounted buffer pointer.
+ */
 void qcap2_rcbuffer_add_ref(qcap2_rcbuffer_t* pRCBuffer);
+
+/*
+ * @brief Decrements the strong refcount of the refcounted buffer, recycling/deleting it if 0.
+ * @param[in] pRCBuffer The refcounted buffer pointer.
+ */
 void qcap2_rcbuffer_release(qcap2_rcbuffer_t* pRCBuffer);
+
+/*
+ * @brief Locks the refcounted buffer's data, incrementing use count.
+ * @param[in] pRCBuffer The refcounted buffer pointer.
+ * @return Pointer to the locked raw media data.
+ * @note Every call to lock_data must be balanced by a call to unlock_data.
+ */
 PVOID qcap2_rcbuffer_lock_data(qcap2_rcbuffer_t* pRCBuffer);
+
+/*
+ * @brief Unlocks the refcounted buffer's data, decrementing use count.
+ * @param[in] pRCBuffer The refcounted buffer pointer.
+ */
 void qcap2_rcbuffer_unlock_data(qcap2_rcbuffer_t* pRCBuffer);
+
+/*
+ * @brief Directly accesses the wrapped raw data without locking (risky).
+ * @param[in] pRCBuffer The refcounted buffer pointer.
+ * @return Pointer to the wrapped raw media data.
+ */
 PVOID qcap2_rcbuffer_get_data(qcap2_rcbuffer_t* pRCBuffer); // risky accessor
+
+/*
+ * @brief Retrieves the current strong reference count.
+ * @param[in] pRCBuffer The refcounted buffer pointer.
+ */
 int32_t qcap2_rcbuffer_use_count(qcap2_rcbuffer_t* pRCBuffer);
+
+/*
+ * @brief Retrieves the current weak reference count.
+ * @param[in] pRCBuffer The refcounted buffer pointer.
+ */
 int32_t qcap2_rcbuffer_weak_count(qcap2_rcbuffer_t* pRCBuffer);
+
+/*
+ * @brief Retrieves the resource manager reference count.
+ * @param[in] pRCBuffer The refcounted buffer pointer.
+ */
 int32_t qcap2_rcbuffer_res_count(qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_av_frame_t
@@ -415,6 +484,8 @@ void qcap2_video_encoder_property_get_type(qcap2_video_encoder_property_t* pThis
 void qcap2_video_encoder_property_set_type(qcap2_video_encoder_property_t* pThis, ULONG   nEncoderType);
 void qcap2_video_encoder_property_get_format(qcap2_video_encoder_property_t* pThis, ULONG * pEncoderFormat);
 void qcap2_video_encoder_property_set_format(qcap2_video_encoder_property_t* pThis, ULONG   nEncoderFormat);
+void qcap2_video_encoder_property_get_color_space(qcap2_video_encoder_property_t* pThis, ULONG * pColorSpaceType);
+void qcap2_video_encoder_property_set_color_space(qcap2_video_encoder_property_t* pThis, ULONG   nColorSpaceType);
 void qcap2_video_encoder_property_get_resolution(qcap2_video_encoder_property_t* pThis, ULONG * pWidth, ULONG * pHeight);
 void qcap2_video_encoder_property_set_resolution(qcap2_video_encoder_property_t* pThis, ULONG   nWidth, ULONG   nHeight);
 void qcap2_video_encoder_property_get_bitrate(qcap2_video_encoder_property_t* pThis, ULONG * pBitRate);

@@ -597,8 +597,8 @@ void MainWindow::init_models() {
 
     QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
         QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_CUSTOMIZED_LITE_NEW,
-        (char*)"/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/model/people_/QDEEP.OD.TINY.PERSON.V10N.CFG",
+        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_LICENSE_PLATE_RECOGNITION_LAW_ENFORCEMENT,
+        (char*)"/home/nvidia/Projects/new_model/lpr_batch/QDEEP.OD.LICENSE.PLATE.RECOGNITION.LAW.TINY.CFG",
         &handle, flag, MAX_BATCH);
 
     QDEEP_API::QDEEP_START_OBJECT_DETECT(handle);
