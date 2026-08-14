@@ -524,6 +524,7 @@ QRETURN ChannelContext::onEventVdec() {
     qcap2_video_scaler_t* pLocalScaler2 = nullptr;
     bool bDisplayEnabled = false;
     bool bSendBuffer = false;
+    double dSourceFrameRate = DEFAULT_AI_TARGET_FPS;
     qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
 
     {
@@ -533,6 +534,7 @@ QRETURN ChannelContext::onEventVdec() {
         pLocalScaler2 = pScaler2;
         bDisplayEnabled = m_bDisplayEnabled;
         bSendBuffer = m_bSendBuffer;
+        dSourceFrameRate = m_dVideoFrameRate;
         pLocalAIQueue = m_pAIQueue;
     }
 
@@ -569,8 +571,12 @@ QRETURN ChannelContext::onEventVdec() {
     if (pScaledBuffer) {
         // ── Destination 1: Push to AI queue (non-blocking) ──────────────────
         if (bSendBuffer && g_pMainwindow && g_pMainwindow->ai_running && pLocalAIQueue) {
-            double current_time = QCAP_GET_TIME();
-            if ((current_time - m_lastProcessTime) >= FRAME_INTERVAL) {
+            // Follow the frame rate reported by the RTSP connected callback.
+            // Some devices report 0 fps, so keep a safe fallback in that case.
+            const double targetFps = dSourceFrameRate > 0.0 ? dSourceFrameRate : DEFAULT_AI_TARGET_FPS;
+            const double frameInterval = 1.0 / targetFps;
+            const double current_time = QCAP_GET_TIME();
+            if ((current_time - m_lastProcessTime) >= frameInterval) {
                 m_lastProcessTime = current_time;
 
                 // If queue full, drop oldest frame to make room
