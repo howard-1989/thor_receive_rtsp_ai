@@ -62,6 +62,14 @@ struct ReIdCandidate {
     std::array<float, QDEEP_MAX_FEATURE_VECTOR_SIZE> feature;
 };
 
+struct ReIdCompareJob {
+    int channelId;
+    quint64 inferenceSequence;
+    quint64 targetVersion;
+    std::vector<ReIdCandidate> candidates;
+    std::vector<std::array<float, QDEEP_MAX_FEATURE_VECTOR_SIZE>> targetFeatures;
+};
+
 struct ChannelContext {
     int channelId;
     QString url;
@@ -179,6 +187,18 @@ public:
     std::vector<std::array<float, QDEEP_MAX_FEATURE_VECTOR_SIZE>> target_features;
     std::mutex target_mtx;
     bool target_capture_armed;
+    quint64 target_version;
+
+    // Comparison is intentionally decoupled from detector submission. Each
+    // channel owns one pending slot, so a newer inference replaces stale work.
+    std::mutex comparison_mtx;
+    std::condition_variable comparison_cv;
+    std::array<ReIdCompareJob, MAX_BATCH> comparison_jobs;
+    std::array<bool, MAX_BATCH> comparison_job_pending;
+    std::array<quint64, MAX_BATCH> inference_sequences;
+    std::array<quint64, MAX_BATCH> draw_box_sequences;
+    std::atomic<bool> comparison_running;
+    std::thread* pComparisonThread;
 
 private:
     void clearGrid();
@@ -191,6 +211,7 @@ private:
     void yolo_start();
     void yolo_stop();
     void ai_inference_thread();
+    void comparison_thread();
 
     // UI elements
     QWidget *centralWidget;

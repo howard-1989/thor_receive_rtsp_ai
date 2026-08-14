@@ -829,6 +829,12 @@ MainWindow::MainWindow(QWidget *parent)
     g_pMainwindow = this;
 
     target_capture_armed = false;
+    comparison_running = false;
+    pComparisonThread = nullptr;
+    target_version = 0;
+    comparison_job_pending.fill(false);
+    inference_sequences.fill(0);
+    draw_box_sequences.fill(0);
 
     // ── Initialize AI members ────────────────────────────────────────────
     color_space.resize(MAX_BATCH);
@@ -967,6 +973,7 @@ void MainWindow::onRegisterTargetClicked()
         std::lock_guard<std::mutex> lock(target_mtx);
         target_features.clear();
         target_capture_armed = true;
+        ++target_version;
     }
     lblTargetStatus->setText("Click a detected person in any channel to register the target.");
 }
@@ -977,6 +984,7 @@ void MainWindow::onClearTargetClicked()
         std::lock_guard<std::mutex> lock(target_mtx);
         target_features.clear();
         target_capture_armed = false;
+        ++target_version;
     }
     lblTargetStatus->setText("No target registered");
 }
@@ -1008,6 +1016,7 @@ bool MainWindow::captureTargetAt(int channelId, int frameX, int frameY)
         target_features.clear();
         target_features.push_back(selected.feature);
         target_capture_armed = false;
+        ++target_version;
     }
     lblTargetStatus->setText(QString("Target registered from CH%1 (detector %2%).")
                                  .arg(channelId + 1)
@@ -1279,6 +1288,13 @@ void MainWindow::yolo_start()
         return;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(comparison_mtx);
+        comparison_job_pending.fill(false);
+    }
+    comparison_running = true;
+    pComparisonThread = new std::thread(&MainWindow::comparison_thread, this);
+
     ai_running = true;
     pAiThread = new std::thread(&MainWindow::ai_inference_thread, this);
 }
@@ -1294,6 +1310,20 @@ void MainWindow::yolo_stop()
         }
         delete pAiThread;
         pAiThread = nullptr;
+    }
+
+    comparison_running = false;
+    comparison_cv.notify_all();
+    if (pComparisonThread) {
+        if (pComparisonThread->joinable()) {
+            pComparisonThread->join();
+        }
+        delete pComparisonThread;
+        pComparisonThread = nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(comparison_mtx);
+        comparison_job_pending.fill(false);
     }
 
     for (ChannelContext *ctx : channels) {
@@ -1440,17 +1470,17 @@ void MainWindow::ai_inference_thread()
             timingReportTimer.restart();
         }
 
-        // Compare every detected person with the registered target feature and
-        // publish both the display boxes and click-selectable feature candidates.
+        // Copy QDEEP output into immutable snapshots before the next detector call
+        // can reuse box_list_vec. Comparison itself runs on a separate worker.
         std::vector<std::array<float, QDEEP_MAX_FEATURE_VECTOR_SIZE>> targetFeatures;
+        quint64 targetVersion = 0;
         {
             std::lock_guard<std::mutex> lock(target_mtx);
             targetFeatures = target_features;
+            targetVersion = target_version;
         }
 
         std::vector<std::vector<DrawBox>> updatedDrawBoxes(batch_channels.size());
-        std::vector<float> topSimilarities(batch_channels.size(), -1.0f);
-        std::vector<size_t> topBoxIndices(batch_channels.size(), 0);
         std::vector<std::vector<ReIdCandidate>> updatedCandidates(batch_channels.size());
         if (api_res == QCAP_RS_SUCCESSFUL) {
             for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
@@ -1473,41 +1503,154 @@ void MainWindow::ai_inference_thread()
                     box.probability = candidate.probability;
                     box.isTarget = false;
                     box.targetSimilarity = -1.0f;
-                    for (const auto& reference : targetFeatures) {
-                        float similarity = 0.0f;
-                        const QRESULT comparisonResult = QDEEP_API::QDEEP_GET_OBJECT_RECOGNITION_COMPARISON(
-                            QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
-                            const_cast<float*>(reference.data()), candidate.feature.data(), &similarity);
-                        if (comparisonResult == QCAP_RS_SUCCESSFUL) {
-                            box.targetSimilarity = std::max(box.targetSimilarity, similarity);
-                        }
-                    }
                     updatedDrawBoxes[batch_index].push_back(box);
-                    if (!targetFeatures.empty() && box.targetSimilarity > topSimilarities[batch_index]) {
-                        topSimilarities[batch_index] = box.targetSimilarity;
-                        topBoxIndices[batch_index] = updatedDrawBoxes[batch_index].size() - 1;
-                    }
                 }
             }
         }
 
-        if (!targetFeatures.empty()) {
-            for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
-                if (topSimilarities[batch_index] >= 0.90f) {
-                    updatedDrawBoxes[batch_index][topBoxIndices[batch_index]].isTarget = true;
+        for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
+            const int channelId = batch_channels[batch_index];
+            const quint64 inferenceSequence = ++inference_sequences[channelId];
+
+            // Publish detection boxes/candidates immediately. The worker may later
+            // enrich these same-sequence boxes with ReID similarity.
+            {
+                std::lock_guard<std::mutex> drawLock(draw_mtx);
+                std::lock_guard<std::mutex> candidateLock(reid_mtx);
+                draw_boxes[channelId] = std::move(updatedDrawBoxes[batch_index]);
+                draw_box_sequences[channelId] = inferenceSequence;
+                latest_candidates[channelId] = updatedCandidates[batch_index];
+            }
+
+            if (!targetFeatures.empty() && !updatedCandidates[batch_index].empty()) {
+                ReIdCompareJob job;
+                job.channelId = channelId;
+                job.inferenceSequence = inferenceSequence;
+                job.targetVersion = targetVersion;
+                job.candidates = std::move(updatedCandidates[batch_index]);
+                job.targetFeatures = targetFeatures;
+                {
+                    std::lock_guard<std::mutex> lock(comparison_mtx);
+                    comparison_jobs[channelId] = std::move(job);
+                    comparison_job_pending[channelId] = true;
                 }
+                comparison_cv.notify_one();
             }
         }
+    }
+}
 
+void MainWindow::comparison_thread()
+{
+    size_t nextChannel = 0;
+    QElapsedTimer reportTimer;
+    reportTimer.start();
+    quint64 jobCount = 0;
+    quint64 comparisonCallCount = 0;
+    double totalMs = 0.0;
+    double minMs = 0.0;
+    double maxMs = 0.0;
 
+    while (comparison_running.load()) {
+        ReIdCompareJob job;
+        bool foundJob = false;
         {
-            std::lock_guard<std::mutex> drawLock(draw_mtx);
-            std::lock_guard<std::mutex> candidateLock(reid_mtx);
-            for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
-                const int channel_id = batch_channels[batch_index];
-                draw_boxes[channel_id] = std::move(updatedDrawBoxes[batch_index]);
-                latest_candidates[channel_id] = std::move(updatedCandidates[batch_index]);
+            std::unique_lock<std::mutex> lock(comparison_mtx);
+            comparison_cv.wait(lock, [this] {
+                if (!comparison_running.load()) return true;
+                for (bool pending : comparison_job_pending) {
+                    if (pending) return true;
+                }
+                return false;
+            });
+            if (!comparison_running.load()) break;
+
+            for (size_t offset = 0; offset < MAX_BATCH; ++offset) {
+                const size_t channel = (nextChannel + offset) % MAX_BATCH;
+                if (comparison_job_pending[channel]) {
+                    job = std::move(comparison_jobs[channel]);
+                    comparison_job_pending[channel] = false;
+                    nextChannel = (channel + 1) % MAX_BATCH;
+                    foundJob = true;
+                    break;
+                }
             }
+        }
+        if (!foundJob) continue;
+
+        QElapsedTimer jobTimer;
+        jobTimer.start();
+        std::vector<DrawBox> comparedBoxes;
+        comparedBoxes.reserve(job.candidates.size());
+        float topSimilarity = -1.0f;
+        size_t topBoxIndex = 0;
+        quint64 callsForJob = 0;
+
+        for (const ReIdCandidate& candidate : job.candidates) {
+            DrawBox box;
+            box.x = candidate.x;
+            box.y = candidate.y;
+            box.width = candidate.width;
+            box.height = candidate.height;
+            box.probability = candidate.probability;
+            box.isTarget = false;
+            box.targetSimilarity = -1.0f;
+
+            for (const auto& reference : job.targetFeatures) {
+                float similarity = 0.0f;
+                const QRESULT comparisonResult = QDEEP_API::QDEEP_GET_OBJECT_RECOGNITION_COMPARISON(
+                    QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
+                    const_cast<float*>(reference.data()),
+                    const_cast<float*>(candidate.feature.data()), &similarity);
+                ++callsForJob;
+                if (comparisonResult == QCAP_RS_SUCCESSFUL) {
+                    box.targetSimilarity = std::max(box.targetSimilarity, similarity);
+                }
+            }
+
+            comparedBoxes.push_back(box);
+            if (box.targetSimilarity > topSimilarity) {
+                topSimilarity = box.targetSimilarity;
+                topBoxIndex = comparedBoxes.size() - 1;
+            }
+        }
+
+        if (!comparedBoxes.empty() && topSimilarity >= 0.90f) {
+            comparedBoxes[topBoxIndex].isTarget = true;
+        }
+
+        const double jobMs = jobTimer.nsecsElapsed() / 1000000.0;
+        ++jobCount;
+        comparisonCallCount += callsForJob;
+        totalMs += jobMs;
+        if (jobCount == 1 || jobMs < minMs) minMs = jobMs;
+        if (jobMs > maxMs) maxMs = jobMs;
+
+        // Apply only if neither the selected target nor this channel's visible
+        // inference has changed while the asynchronous comparison was running.
+        if (comparison_running.load()) {
+            std::lock_guard<std::mutex> targetLock(target_mtx);
+            if (job.targetVersion == target_version) {
+                std::lock_guard<std::mutex> drawLock(draw_mtx);
+                if (draw_box_sequences[job.channelId] == job.inferenceSequence) {
+                    draw_boxes[job.channelId] = std::move(comparedBoxes);
+                }
+            }
+        }
+
+        if (reportTimer.elapsed() >= 3000) {
+            qDebug() << QStringLiteral("[QDEEP comparison timing: last 3s] jobs=%1 calls=%2 min_ms=%3 max_ms=%4 avg_ms=%5")
+                        .arg(jobCount)
+                        .arg(comparisonCallCount)
+                        .arg(minMs, 0, 'f', 3)
+                        .arg(maxMs, 0, 'f', 3)
+                        .arg(jobCount > 0 ? totalMs / jobCount : 0.0, 0, 'f', 3);
+            jobCount = 0;
+            comparisonCallCount = 0;
+            totalMs = 0.0;
+            minMs = 0.0;
+            maxMs = 0.0;
+            reportTimer.restart();
         }
     }
 }
