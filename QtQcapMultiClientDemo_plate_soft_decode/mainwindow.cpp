@@ -662,7 +662,7 @@ QRETURN ChannelContext::onEventVdec() {
                             // Draw AI results if enabled
                             if (g_pMainwindow && g_pMainwindow->m_bShowOverlay) {
                                 std::string headerText = "CH " + std::to_string(channelId + 1);
-                                cv::putText(bgr_mat, headerText, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
+                                cv::putText(bgr_mat, headerText, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 200), 2);
 
                                 std::vector<DrawBox> local_boxes;
                                 {
@@ -680,17 +680,17 @@ QRETURN ChannelContext::onEventVdec() {
                                     const int titleY = box.original_y > 22 ? box.original_y - 6 : box.original_y + 20;
                                     cv::putText(bgr_mat, detectionText,
                                                 cv::Point(box.original_x, titleY),
-                                                cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                                                cv::FONT_HERSHEY_SIMPLEX, 0.4,
                                                 cv::Scalar(0, 255, 0), 2);
 
                                     if (!box.plateText.isEmpty()) {
-                                        const std::string plateText = "[LP] " + box.plateText.toStdString();
+                                        const std::string plateText = box.plateText.toStdString();
                                         const int plateY = std::min(
                                                 box.original_y + box.original_h + 22,
                                                 bgr_mat.rows - 4);
                                         cv::putText(bgr_mat, plateText,
                                                     cv::Point(box.original_x, plateY),
-                                                    cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                                                    cv::FONT_HERSHEY_SIMPLEX, 0.4,
                                                     cv::Scalar(0, 220, 255), 2);
                                     }
                                 }
@@ -741,7 +741,7 @@ MainWindow::MainWindow(QWidget *parent)
       ai_running(false), pAiThread(nullptr),
       ready_count(0), active_camera_count(0)
 {
-    setWindowTitle("QCAP Multichannel RTSP + QDEEP Plate");
+    setWindowTitle("QCAP Multichannel RTSP + QDEEP Plate Soft Decode");
     resize(1280, 720);
 
     g_pMainwindow = this;
@@ -859,7 +859,7 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            QString defaultUrl = QString("rtsp://root:root@192.168.191.6:1554/session0.mpg");
+            QString defaultUrl = QString("rtsp://root:root@192.168.190.178:554/session0.mpg");
             tableUrls->setItem(i, 1, new QTableWidgetItem(defaultUrl));
         }
     }
