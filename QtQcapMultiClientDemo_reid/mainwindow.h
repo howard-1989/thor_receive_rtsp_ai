@@ -24,6 +24,7 @@
 #include <QElapsedTimer>
 
 #include <vector>
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -47,6 +48,17 @@ struct DrawBox {
     int width;
     int height;
     float probability;
+    bool isTarget;
+    float targetSimilarity;
+};
+
+struct ReIdCandidate {
+    int x;
+    int y;
+    int width;
+    int height;
+    float probability;
+    std::array<float, QDEEP_MAX_FEATURE_VECTOR_SIZE> feature;
 };
 
 struct ChannelContext {
@@ -129,6 +141,8 @@ private slots:
     void onDisplayToggled(bool checked);
     void onOverlayToggled(bool checked);
     void onHalfRefreshRateToggled(bool checked);
+    void onRegisterTargetClicked();
+    void onClearTargetClicked();
 
 public:
     bool m_bShowOverlay;
@@ -161,9 +175,16 @@ public:
     std::vector<DrawBox> draw_boxes[MAX_BATCH];
     std::mutex draw_mtx;
 
+    std::vector<ReIdCandidate> latest_candidates[MAX_BATCH];
+    std::mutex reid_mtx;
+    std::vector<std::array<float, QDEEP_MAX_FEATURE_VECTOR_SIZE>> target_features;
+    std::mutex target_mtx;
+    bool target_capture_armed;
+
 private:
     void clearGrid();
     void stopAllChannels();
+    bool captureTargetAt(int channelId, int frameX, int frameY);
 
     // ── AI Functions ─────────────────────────────────────────────────────
     void init_models();
@@ -185,6 +206,9 @@ private:
     QCheckBox *chkEnableDisplay;
     QCheckBox *chkShowOverlay;
     QCheckBox *chkHalfRefreshRate;
+    QPushButton *btnRegisterTarget;
+    QPushButton *btnClearTarget;
+    QLabel *lblTargetStatus;
     QLabel *lblStatus;
 };
 

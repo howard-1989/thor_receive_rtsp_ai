@@ -642,17 +642,29 @@ QRETURN ChannelContext::onEventVdec() {
                                     local_boxes = g_pMainwindow->draw_boxes[channelId];
                                 }
 
-                                std::string headerText = "CH " + std::to_string(channelId + 1) + " | People: " + std::to_string(local_boxes.size());
+                                int targetCount = 0;
+                                for (const auto& box : local_boxes) {
+                                    if (box.isTarget) ++targetCount;
+                                }
+                                std::string headerText = "CH " + std::to_string(channelId + 1) + " | People: "
+                                    + std::to_string(local_boxes.size()) + " | Target: " + std::to_string(targetCount);
                                 cv::putText(bgr_mat, headerText, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
 
                                 for (const auto& box : local_boxes) {
                                     cv::Rect rect(box.x, box.y, box.width, box.height);
                                     
-                                    // Draw bounding box outline
-                                    cv::rectangle(bgr_mat, rect, cv::Scalar(0, 255, 0), 2);
+                                    // Registered target is green; other people remain yellow.
+                                    const cv::Scalar boxColor = box.isTarget ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
+                                    cv::rectangle(bgr_mat, rect, boxColor, 2);
 
-                                    // Draw text label with class/prob
-                                    std::string labelText = "Person: " + std::to_string((int)(box.probability * 100)) + "%";
+                                    std::string labelText;
+                                    if (box.isTarget) {
+                                        labelText = "TARGET: " + std::to_string((int)(box.targetSimilarity * 100)) + "%";
+                                    } else if (box.targetSimilarity >= 0.0f) {
+                                        labelText = "Person / ReID: " + std::to_string((int)(box.targetSimilarity * 100)) + "%";
+                                    } else {
+                                        labelText = "Person: " + std::to_string((int)(box.probability * 100)) + "%";
+                                    }
                                     int baseLine = 0;
                                     cv::Size labelSize = cv::getTextSize(labelText, cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseLine);
                                     
@@ -664,7 +676,7 @@ QRETURN ChannelContext::onEventVdec() {
                                     // Draw label background
                                     cv::rectangle(bgr_mat, cv::Point(box.x, textY - labelSize.height - 2), 
                                                   cv::Point(box.x + labelSize.width, textY + baseLine), 
-                                                  cv::Scalar(0, 255, 0), cv::FILLED);
+                                                  boxColor, cv::FILLED);
                                                   
                                     // Draw label text in black
                                     cv::putText(bgr_mat, labelText, cv::Point(box.x, textY), 
@@ -722,6 +734,8 @@ MainWindow::MainWindow(QWidget *parent)
     resize(1280, 720);
 
     g_pMainwindow = this;
+
+    target_capture_armed = false;
 
     // ── Initialize AI members ────────────────────────────────────────────
     color_space.resize(MAX_BATCH);
@@ -782,6 +796,17 @@ MainWindow::MainWindow(QWidget *parent)
 
     controlLayout->addWidget(grpConfig);
 
+    QGroupBox *grpTarget = new QGroupBox("ReID Target", controlPanel);
+    QVBoxLayout *targetLayout = new QVBoxLayout(grpTarget);
+    btnRegisterTarget = new QPushButton("Register Target (click a person)", grpTarget);
+    btnClearTarget = new QPushButton("Clear Target", grpTarget);
+    targetLayout->addWidget(btnRegisterTarget);
+    targetLayout->addWidget(btnClearTarget);
+    lblTargetStatus = new QLabel("No target registered", grpTarget);
+    lblTargetStatus->setWordWrap(true);
+    targetLayout->addWidget(lblTargetStatus);
+    controlLayout->addWidget(grpTarget);
+
     lblStatus = new QLabel("Status: Idle", controlPanel);
     lblStatus->setWordWrap(true);
     controlLayout->addWidget(lblStatus);
@@ -806,6 +831,8 @@ MainWindow::MainWindow(QWidget *parent)
     connect(chkEnableDisplay, &QCheckBox::toggled, this, &MainWindow::onDisplayToggled);
     connect(chkShowOverlay, &QCheckBox::toggled, this, &MainWindow::onOverlayToggled);
     connect(chkHalfRefreshRate, &QCheckBox::toggled, this, &MainWindow::onHalfRefreshRateToggled);
+    connect(btnRegisterTarget, &QPushButton::clicked, this, &MainWindow::onRegisterTargetClicked);
+    connect(btnClearTarget, &QPushButton::clicked, this, &MainWindow::onClearTargetClicked);
 
     videoContainer->installEventFilter(this);
 
@@ -841,6 +868,60 @@ void MainWindow::onChannelCountChanged(int count)
     }
 }
 
+void MainWindow::onRegisterTargetClicked()
+{
+    {
+        std::lock_guard<std::mutex> lock(target_mtx);
+        target_features.clear();
+        target_capture_armed = true;
+    }
+    lblTargetStatus->setText("Click a detected person in any channel to register the target.");
+}
+
+void MainWindow::onClearTargetClicked()
+{
+    {
+        std::lock_guard<std::mutex> lock(target_mtx);
+        target_features.clear();
+        target_capture_armed = false;
+    }
+    lblTargetStatus->setText("No target registered");
+}
+
+bool MainWindow::captureTargetAt(int channelId, int frameX, int frameY)
+{
+    ReIdCandidate selected;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(reid_mtx);
+        if (channelId < 0 || channelId >= MAX_BATCH) return false;
+        for (const ReIdCandidate& candidate : latest_candidates[channelId]) {
+            const bool inside = frameX >= candidate.x && frameX < candidate.x + candidate.width
+                && frameY >= candidate.y && frameY < candidate.y + candidate.height;
+            if (inside && (!found || candidate.width * candidate.height < selected.width * selected.height)) {
+                selected = candidate;
+                found = true;
+            }
+        }
+    }
+
+    if (!found) {
+        lblTargetStatus->setText("No detected person at this position. Try again when a person box is visible.");
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(target_mtx);
+        target_features.clear();
+        target_features.push_back(selected.feature);
+        target_capture_armed = false;
+    }
+    lblTargetStatus->setText(QString("Target registered from CH%1 (detector %2%).")
+                                 .arg(channelId + 1)
+                                 .arg(selected.probability * 100.0f, 0, 'f', 0));
+    return true;
+}
+
 void MainWindow::onBtnStartClicked()
 {
     stopAllChannels();
@@ -874,6 +955,8 @@ void MainWindow::onBtnStartClicked()
         label->setAlignment(Qt::AlignCenter);
         label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
         label->setScaledContents(true);
+        label->setProperty("channelId", i);
+        label->installEventFilter(this);
         layout->addWidget(label);
 
         videoFrames.append(frame);
@@ -962,6 +1045,21 @@ void MainWindow::closeEvent(QCloseEvent *event)
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
+    if (event->type() == QEvent::MouseButtonPress) {
+        QLabel *label = qobject_cast<QLabel*>(watched);
+        bool captureArmed = false;
+        {
+            std::lock_guard<std::mutex> lock(target_mtx);
+            captureArmed = target_capture_armed;
+        }
+        if (label && captureArmed && label->property("channelId").isValid()) {
+            QMouseEvent *mouseEvent = static_cast<QMouseEvent*>(event);
+            const int frameX = mouseEvent->pos().x() * 640 / qMax(1, label->width());
+            const int frameY = mouseEvent->pos().y() * 384 / qMax(1, label->height());
+            captureTargetAt(label->property("channelId").toInt(), frameX, frameY);
+            return true;
+        }
+    }
     if (event->type() == QEvent::MouseButtonDblClick) {
         m_bFullscreen = !m_bFullscreen;
         if (m_bFullscreen) {
@@ -1228,7 +1326,7 @@ void MainWindow::ai_inference_thread()
         inferenceTimer.start();
         const QRESULT api_res = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
             handle, color_space.data(), width_vec.data(), height_vec.data(),
-            buffer_vec.data(), buffer_len_vec.data(), box_list_vec.data(), box_size_vec.data(), batch_size);
+            buffer_vec.data(), buffer_len_vec.data(), box_list_vec.data(), box_size_vec.data(), batch_size, flag);
         const double apiMs = inferenceTimer.nsecsElapsed() / 1000000.0;
 
         ++apiSampleCount;
@@ -1249,26 +1347,73 @@ void MainWindow::ai_inference_thread()
             timingReportTimer.restart();
         }
 
-        // Map compact QDEEP results back to their original RTSP channel IDs.
+        // Compare every detected person with the registered target feature and
+        // publish both the display boxes and click-selectable feature candidates.
+        std::vector<std::array<float, QDEEP_MAX_FEATURE_VECTOR_SIZE>> targetFeatures;
         {
-            std::lock_guard<std::mutex> draw_lock(draw_mtx);
-            for (int channel_id : batch_channels) {
-                draw_boxes[channel_id].clear();
-            }
-            if (api_res == QCAP_RS_SUCCESSFUL) {
-                for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
-                    std::vector<DrawBox>& channel_boxes = draw_boxes[batch_channels[batch_index]];
-                    for (ULONG j = 0; j < box_size_vec[batch_index]; ++j) {
-                        auto& deep_box = box_list_vec[batch_index][j];
-                        DrawBox box;
-                        box.x = deep_box.nX;
-                        box.y = deep_box.nY;
-                        box.width = deep_box.nWidth;
-                        box.height = deep_box.nHeight;
-                        box.probability = deep_box.fProbability;
-                        channel_boxes.push_back(box);
+            std::lock_guard<std::mutex> lock(target_mtx);
+            targetFeatures = target_features;
+        }
+
+        std::vector<std::vector<DrawBox>> updatedDrawBoxes(batch_channels.size());
+        std::vector<float> topSimilarities(batch_channels.size(), -1.0f);
+        std::vector<size_t> topBoxIndices(batch_channels.size(), 0);
+        std::vector<std::vector<ReIdCandidate>> updatedCandidates(batch_channels.size());
+        if (api_res == QCAP_RS_SUCCESSFUL) {
+            for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
+                for (ULONG j = 0; j < box_size_vec[batch_index]; ++j) {
+                    const auto& deep_box = box_list_vec[batch_index][j];
+                    ReIdCandidate candidate;
+                    candidate.x = static_cast<int>(deep_box.nX);
+                    candidate.y = static_cast<int>(deep_box.nY);
+                    candidate.width = static_cast<int>(deep_box.nWidth);
+                    candidate.height = static_cast<int>(deep_box.nHeight);
+                    candidate.probability = deep_box.fProbability;
+                    memcpy(candidate.feature.data(), deep_box.fFeatureVectors, sizeof(deep_box.fFeatureVectors));
+                    updatedCandidates[batch_index].push_back(candidate);
+
+                    DrawBox box;
+                    box.x = candidate.x;
+                    box.y = candidate.y;
+                    box.width = candidate.width;
+                    box.height = candidate.height;
+                    box.probability = candidate.probability;
+                    box.isTarget = false;
+                    box.targetSimilarity = -1.0f;
+                    for (const auto& reference : targetFeatures) {
+                        float similarity = 0.0f;
+                        const QRESULT comparisonResult = QDEEP_API::QDEEP_GET_OBJECT_RECOGNITION_COMPARISON(
+                            QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
+                            const_cast<float*>(reference.data()), candidate.feature.data(), &similarity);
+                        if (comparisonResult == QCAP_RS_SUCCESSFUL) {
+                            box.targetSimilarity = std::max(box.targetSimilarity, similarity);
+                        }
+                    }
+                    updatedDrawBoxes[batch_index].push_back(box);
+                    if (!targetFeatures.empty() && box.targetSimilarity > topSimilarities[batch_index]) {
+                        topSimilarities[batch_index] = box.targetSimilarity;
+                        topBoxIndices[batch_index] = updatedDrawBoxes[batch_index].size() - 1;
                     }
                 }
+            }
+        }
+
+        if (!targetFeatures.empty()) {
+            for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
+                if (topSimilarities[batch_index] >= 0.90f) {
+                    updatedDrawBoxes[batch_index][topBoxIndices[batch_index]].isTarget = true;
+                }
+            }
+        }
+
+
+        {
+            std::lock_guard<std::mutex> drawLock(draw_mtx);
+            std::lock_guard<std::mutex> candidateLock(reid_mtx);
+            for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
+                const int channel_id = batch_channels[batch_index];
+                draw_boxes[channel_id] = std::move(updatedDrawBoxes[batch_index]);
+                latest_candidates[channel_id] = std::move(updatedCandidates[batch_index]);
             }
         }
     }

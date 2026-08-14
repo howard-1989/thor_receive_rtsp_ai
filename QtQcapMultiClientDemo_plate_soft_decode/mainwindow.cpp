@@ -1,22 +1,34 @@
 #include "mainwindow.h"
-#include <QDebug>
+#include <fstream>
+#include "qcap.linux.h"
 #include <QHBoxLayout>
+#include <QElapsedTimer>
 #include <QVBoxLayout>
 #include <QGroupBox>
 #include <QHeaderView>
-#include <QEvent>
-#include <QMouseEvent>
-#include <QPointer>
-#include <QMetaObject>
-#include <QPixmap>
-
-#include <opencv2/opencv.hpp>
+#include <QApplication>
+#include <QScreen>
+#include <QDebug>
+#include <QCloseEvent>
+#include <QResizeEvent>
+#include <QMoveEvent>
+#include <QHideEvent>
+#include <QShowEvent>
+#include <QPainter>
+#include <QDateTime>
+#include <cmath>
+#include <algorithm>
 
 MainWindow *g_pMainwindow = nullptr;
+//arya
+uint32_t count = 0;
+double elapsed = 0.0;
 
 extern "C" {
 QDEEP_EXT_API QRESULT QDEEP_EXPORT QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(PVOID pDetector, ULONG* pCheckNum);
 }
+
+#include <opencv2/opencv.hpp>
 
 QImage cvMatToQImage(const cv::Mat& mat) {
     if (mat.type() == CV_8UC3) {
@@ -79,7 +91,7 @@ ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
     : channelId(id), url(streamUrl), m_pLabel(pLabel),
       pClient(nullptr), pVdec(nullptr), pEventHandlers(nullptr),
       pEvent_vdec(nullptr),
-      pScaler2(nullptr), pScaler3(nullptr),
+      pScaler2(nullptr),
       m_pCurrentAIRCBuffer(nullptr),
       m_pAIQueue(nullptr),
       m_nVideoWidth(0), m_nVideoHeight(0), m_dVideoFrameRate(0.0), m_nVideoEncoderFormat(0),
@@ -91,10 +103,8 @@ ChannelContext::ChannelContext(int id, const QString& streamUrl, QLabel* pLabel)
 {
     m_pPendingUpdate = std::make_shared<std::atomic<bool>>(false);
     m_displayFrameCount = 0;
-    for (int i = 0; i < 8; ++i) {
-        m_pScalerBuffers3[i] = nullptr;
-    }
 }
+
 
 ChannelContext::~ChannelContext() {
     if (m_pAIBuffer) {
@@ -148,30 +158,22 @@ bool ChannelContext::start() {
 void ChannelContext::cleanupPipeline() {
     qcap2_event_handlers_t* pLocalEventHandlers = nullptr;
     qcap2_video_scaler_t* pLocalScaler2 = nullptr;
-    qcap2_video_scaler_t* pLocalScaler3 = nullptr;
     qcap2_video_decoder_t* pLocalVdec = nullptr;
     qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
     qcap2_event_t* pLocalEvent_vdec = nullptr;
     qcap2_rcbuffer_t* pLocalCurrentAIRCBuffer = nullptr;
-    qcap2_rcbuffer_t* pLocalScalerBuffers3[8] = {nullptr};
 
     {
         QMutexLocker locker(&m_mutex);
         pLocalEventHandlers = pEventHandlers;
         pLocalScaler2 = pScaler2;
-        pLocalScaler3 = pScaler3;
         pLocalVdec = pVdec;
         pLocalAIQueue = m_pAIQueue;
         pLocalEvent_vdec = pEvent_vdec;
         pLocalCurrentAIRCBuffer = m_pCurrentAIRCBuffer;
-        for (int i = 0; i < 8; ++i) {
-            pLocalScalerBuffers3[i] = m_pScalerBuffers3[i];
-            m_pScalerBuffers3[i] = nullptr;
-        }
 
         pEventHandlers = nullptr;
         pScaler2 = nullptr;
-        pScaler3 = nullptr;
         pVdec = nullptr;
         m_pAIQueue = nullptr;
         pEvent_vdec = nullptr;
@@ -208,10 +210,6 @@ void ChannelContext::cleanupPipeline() {
         qDebug() << "CH" << channelId << "cleanup: Stopping Scaler 2...";
         qcap2_video_scaler_stop(pLocalScaler2);
     }
-    if (pLocalScaler3) {
-        qDebug() << "CH" << channelId << "cleanup: Stopping Scaler 3...";
-        qcap2_video_scaler_stop(pLocalScaler3);
-    }
 
     // 5. Stop the AI Queue
     if (pLocalAIQueue) {
@@ -223,20 +221,9 @@ void ChannelContext::cleanupPipeline() {
         qcap2_rcbuffer_queue_stop(pLocalAIQueue);
     }
 
-    qDebug() << "CH" << channelId << "cleanup: Releasing Scaler 3 CPU buffers...";
-    for (int i = 0; i < 8; ++i) {
-        if (pLocalScalerBuffers3[i]) {
-            qcap2_rcbuffer_release(pLocalScalerBuffers3[i]);
-        }
-    }
-
     if (pLocalScaler2) {
         qDebug() << "CH" << channelId << "cleanup: Deleting Scaler 2...";
         qcap2_video_scaler_delete(pLocalScaler2);
-    }
-    if (pLocalScaler3) {
-        qDebug() << "CH" << channelId << "cleanup: Deleting Scaler 3...";
-        qcap2_video_scaler_delete(pLocalScaler3);
     }
     if (pLocalAIQueue) {
         qDebug() << "CH" << channelId << "cleanup: Deleting AI Queue...";
@@ -388,7 +375,7 @@ QRETURN ChannelContext::onConnected(
     qcap2_event_get_native_handle(pEvent_vdec, &nHandle_vdec);
     qcap2_event_handlers_add_handler(pEventHandlers, nHandle_vdec, on_event_vdec_callback, this);
 
-    // Initialize NVIDIA hardware decoder
+    // Initialize nvv4l2 Hardware Decoder
     pVdec = qcap2_video_decoder_new();
     if (!pVdec) {
         qCritical() << "CH" << channelId << "Failed to create video decoder.";
@@ -423,7 +410,7 @@ QRETURN ChannelContext::onConnected(
     qDebug() << "Trace: Setting property1 on property object...";
     qcap2_video_encoder_property_set_property1(pProp,
                                                0,
-                                               QCAP_ENCODER_TYPE_NVIDIA_NVENC,
+                                               QCAP_ENCODER_TYPE_SOFTWARE,
                                                nVideoEncoderFormat,
                                                QCAP_COLORSPACE_TYPE_NV12,
                                                nVideoWidth, nVideoHeight, dVideoFrameRate,
@@ -475,28 +462,9 @@ QRETURN ChannelContext::onConnected(
         return QCAP_RT_OK;
     }
 
-    qDebug() << "Trace: Creating video scaler 3 (Scaler 3)...";
-    pScaler3 = qcap2_video_scaler_new();
-    if (!pScaler3) {
-        qCritical() << "CH" << channelId << "Failed to create video scaler 3.";
-        m_statusInfo = "Error: Failed to create video scaler 3";
-        qcap2_video_scaler_delete(pScaler2);
-        pScaler2 = nullptr;
-        qcap2_video_decoder_stop(pVdec);
-        qcap2_video_decoder_delete(pVdec);
-        pVdec = nullptr;
-        qcap2_event_handlers_remove_handler(pEventHandlers, nHandle_vdec);
-        qcap2_event_handlers_stop(pEventHandlers);
-        qcap2_event_handlers_delete(pEventHandlers);
-        pEventHandlers = nullptr;
-        qcap2_event_stop(pEvent_vdec);
-        qcap2_event_delete(pEvent_vdec);
-        pEvent_vdec = nullptr;
-        return QCAP_RT_OK;
-    }
-
     qDebug() << "Trace: Setting video scaler 2 properties (Scaler 2)...";
-    qcap2_video_scaler_set_backend_type(pScaler2, QCAP2_VIDEO_SCALER_BACKEND_TYPE_NPP);
+    // Scaler 1: DEFAULT scaler 1920x1080 sysbuf -> 640x384 sysbuf
+    qcap2_video_scaler_set_backend_type(pScaler2, QCAP2_VIDEO_SCALER_BACKEND_TYPE_DEFAULT);
     qcap2_video_format_t* pScalerFormat2 = qcap2_video_format_new();
     if (pScalerFormat2) {
         qcap2_video_format_set_property(pScalerFormat2, QCAP_COLORSPACE_TYPE_NV12, 640, 384, bVideoIsInterleaved, dVideoFrameRate);
@@ -505,47 +473,14 @@ QRETURN ChannelContext::onConnected(
     }
     qcap2_video_scaler_set_frame_count(pScaler2, 8);
 
-    qcap2_video_scaler_set_dst_buffer_hint(pScaler2, QCAP2_BUFFER_HINT_CUDA); // CUDA output
+    qcap2_video_scaler_set_src_buffer_hint(pScaler2, QCAP2_BUFFER_HINT_DEFAULT);
+    qcap2_video_scaler_set_dst_buffer_hint(pScaler2, QCAP2_BUFFER_HINT_DEFAULT); // sysbuf output
     qcap2_video_scaler_set_auto_run(pScaler2, true);
 
     qDebug() << "Trace: Starting video scaler 2 (Scaler 2)...";
     qres = qcap2_video_scaler_start(pScaler2);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qCritical() << "qcap2_video_scaler_start for Scaler 2 failed for CH" << channelId << "qres =" << qres;
-    }
-
-    qDebug() << "Trace: Setting video scaler 3 properties (Scaler 3)...";
-    qcap2_video_scaler_set_backend_type(pScaler3, QCAP2_VIDEO_SCALER_BACKEND_TYPE_NPP);
-    qcap2_video_format_t* pScalerFormat3 = qcap2_video_format_new();
-    if (pScalerFormat3) {
-        qcap2_video_format_set_property(pScalerFormat3, QCAP_COLORSPACE_TYPE_NV12, 640, 384, bVideoIsInterleaved, dVideoFrameRate);
-        qcap2_video_scaler_set_video_format(pScaler3, pScalerFormat3);
-        qcap2_video_format_delete(pScalerFormat3);
-    }
-    qcap2_video_scaler_set_frame_count(pScaler3, 8);
-
-    for (int i = 0; i < 8; ++i) {
-        m_pScalerBuffers3[i] = qcap2_rcbuffer_new_av_frame();
-        qcap2_av_frame_t* pAVFrame = static_cast<qcap2_av_frame_t*>(qcap2_rcbuffer_lock_data(m_pScalerBuffers3[i]));
-        if (!pAVFrame) {
-            qCritical() << "CH" << channelId << "Failed to lock scaler 3 buffer" << i;
-            continue;
-        }
-        qcap2_av_frame_set_video_property(pAVFrame, QCAP_COLORSPACE_TYPE_NV12, 640, 384);
-        if (!qcap2_av_frame_alloc_buffer(pAVFrame, 32, 1)) {
-            qCritical() << "CH" << channelId << "Failed to allocate scaler 3 buffer" << i;
-        }
-        qcap2_rcbuffer_unlock_data(m_pScalerBuffers3[i]);
-    }
-    qcap2_video_scaler_set_buffers(pScaler3, &m_pScalerBuffers3[0]);
-    qcap2_video_scaler_set_src_buffer_hint(pScaler3, QCAP2_BUFFER_HINT_CUDA);
-    qcap2_video_scaler_set_dst_buffer_hint(pScaler3, QCAP2_BUFFER_HINT_DEFAULT);
-    qcap2_video_scaler_set_auto_run(pScaler3, true);
-
-    qDebug() << "Trace: Starting video scaler 3 (Scaler 3)...";
-    qres = qcap2_video_scaler_start(pScaler3);
-    if (qres != QCAP_RS_SUCCESSFUL) {
-        qCritical() << "qcap2_video_scaler_start for Scaler 3 failed for CH" << channelId << "qres =" << qres;
     }
 
     // ── Create AI Queue ────────────────────────────────────────────────
@@ -566,6 +501,7 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
     Q_UNUSED(dSampleTime);
     Q_UNUSED(bIsKeyFrame);
 
+    //    qDebug() << "Trace: onVideoCallback entry";
     qcap2_video_decoder_t* pLocalVdec = nullptr;
 
     {
@@ -578,14 +514,17 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
 
     qcap2_rcbuffer_t* pRCBuffer = qcap2_rcbuffer_cast(pStreamBuffer, nStreamBufferLen);
     if (!pRCBuffer) {
+        qDebug() << "Trace: onVideoCallback - pRCBuffer is null";
         return QCAP_RT_OK;
     }
 
-    // Push packet directly to the hardware decoder
+    //    qDebug() << "Trace: onVideoCallback - pushing H.264 packet to decoder...";
+    // Push H.264 packet directly to the hardware decoder
     QRESULT qres = qcap2_video_decoder_push(pLocalVdec, pRCBuffer);
     if (qres != QCAP_RS_SUCCESSFUL) {
         qCritical() << "qcap2_video_decoder_push failed for CH" << channelId << "qres =" << qres;
     }
+    //    qDebug() << "Trace: onVideoCallback finished pushing";
 
     if (!m_pushTimer.isValid()) {
         m_pushTimer.start();
@@ -601,23 +540,21 @@ QRETURN ChannelContext::onVideoCallback(double dSampleTime, BYTE * pStreamBuffer
 
 QRETURN ChannelContext::onEventVdec() {
     qcap2_video_decoder_t* pLocalVdec = nullptr;
-    qcap2_video_scaler_t* pLocalScaler3 = nullptr;
     qcap2_video_scaler_t* pLocalScaler2 = nullptr;
     bool bDisplayEnabled = false;
     bool bSendBuffer = false;
-    qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
     double dSourceFrameRate = DEFAULT_AI_TARGET_FPS;
+    qcap2_rcbuffer_queue_t* pLocalAIQueue = nullptr;
 
     {
         QMutexLocker locker(&m_mutex);
         if (!pVdec) return QCAP_RT_OK;
         pLocalVdec = pVdec;
         pLocalScaler2 = pScaler2;
-        pLocalScaler3 = pScaler3;
         bDisplayEnabled = m_bDisplayEnabled;
         bSendBuffer = m_bSendBuffer;
-        pLocalAIQueue = m_pAIQueue;
         dSourceFrameRate = m_dVideoFrameRate;
+        pLocalAIQueue = m_pAIQueue;
     }
 
     qcap2_rcbuffer_t* pRCBuffer_vdec = nullptr;
@@ -637,32 +574,27 @@ QRETURN ChannelContext::onEventVdec() {
         m_fpsTimer.restart();
     }
 
-    qcap2_rcbuffer_t* pScaledBuffer_nvbuf = nullptr;
     qcap2_rcbuffer_t* pScaledBuffer = nullptr;
     if (pLocalScaler2) {
         qres = qcap2_video_scaler_push(pLocalScaler2, pRCBuffer_vdec);
         if (qres == QCAP_RS_SUCCESSFUL) {
-            qres = qcap2_video_scaler_pop(pLocalScaler2, &pScaledBuffer_nvbuf);
+            qres = qcap2_video_scaler_pop(pLocalScaler2, &pScaledBuffer);
+            if (qres != QCAP_RS_SUCCESSFUL || !pScaledBuffer) {
+                qDebug() << "Trace: onEventVdec - scaler pop failed, qres=" << qres;
+            }
+        } else {
+            qDebug() << "Trace: onEventVdec - scaler push failed, qres=" << qres;
         }
-    }
-
-    if (pLocalScaler3 && pScaledBuffer_nvbuf) {
-        qres = qcap2_video_scaler_push(pLocalScaler3, pScaledBuffer_nvbuf);
-        if (qres == QCAP_RS_SUCCESSFUL) {
-            qres = qcap2_video_scaler_pop(pLocalScaler3, &pScaledBuffer);
-        }
-    }
-
-    if (pScaledBuffer_nvbuf) {
-        qcap2_rcbuffer_release(pScaledBuffer_nvbuf);
     }
 
     if (pScaledBuffer) {
         // ── Destination 1: Push to AI queue (non-blocking) ──────────────────
         if (bSendBuffer && g_pMainwindow && g_pMainwindow->ai_running && pLocalAIQueue) {
+            // Follow the frame rate reported by the RTSP connected callback.
+            // Some devices report 0 fps, so keep a safe fallback in that case.
             const double targetFps = dSourceFrameRate > 0.0 ? dSourceFrameRate : DEFAULT_AI_TARGET_FPS;
             const double frameInterval = 1.0 / targetFps;
-            double current_time = QCAP_GET_TIME();
+            const double current_time = QCAP_GET_TIME();
             if ((current_time - m_lastProcessTime) >= frameInterval) {
                 m_lastProcessTime = current_time;
 
@@ -729,55 +661,39 @@ QRETURN ChannelContext::onEventVdec() {
 
                             // Draw AI results if enabled
                             if (g_pMainwindow && g_pMainwindow->m_bShowOverlay) {
+                                std::string headerText = "CH " + std::to_string(channelId + 1);
+                                cv::putText(bgr_mat, headerText, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 200), 2);
+
                                 std::vector<DrawBox> local_boxes;
                                 {
                                     std::lock_guard<std::mutex> draw_lock(g_pMainwindow->draw_mtx);
                                     local_boxes = g_pMainwindow->draw_boxes[channelId];
                                 }
 
-                                int targetCount = 0;
                                 for (const auto& box : local_boxes) {
-                                    if (box.isTarget) ++targetCount;
-                                }
-                                std::string headerText = "CH " + std::to_string(channelId + 1) + " | People: "
-                                    + std::to_string(local_boxes.size()) + " | Target: " + std::to_string(targetCount);
-                                cv::putText(bgr_mat, headerText, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
+                                    cv::Rect rect(box.original_x, box.original_y,
+                                                  box.original_w, box.original_h);
+                                    cv::rectangle(bgr_mat, rect, cv::Scalar(0, 255, 0), 2);
 
-                                for (const auto& box : local_boxes) {
-                                    cv::Rect rect(box.x, box.y, box.width, box.height);
-                                    
-                                    // Registered target is green; other people remain yellow.
-                                    const cv::Scalar boxColor = box.isTarget ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
-                                    cv::rectangle(bgr_mat, rect, boxColor, 2);
+                                    std::string detectionText = "C:" + std::to_string(box.classId) +
+                                            " [" + std::to_string(static_cast<int>(box.probability * 100.0f)) + "%]";
+                                    const int titleY = box.original_y > 22 ? box.original_y - 6 : box.original_y + 20;
+                                    cv::putText(bgr_mat, detectionText,
+                                                cv::Point(box.original_x, titleY),
+                                                cv::FONT_HERSHEY_SIMPLEX, 0.4,
+                                                cv::Scalar(0, 255, 0), 2);
 
-                                    std::string labelText;
-                                    if (box.isTarget) {
-                                        labelText = "TARGET: " + std::to_string((int)(box.targetSimilarity * 100)) + "%";
-                                    } else if (box.targetSimilarity >= 0.0f) {
-                                        labelText = "Person / ReID: " + std::to_string((int)(box.targetSimilarity * 100)) + "%";
-                                    } else {
-                                        labelText = "Person: " + std::to_string((int)(box.probability * 100)) + "%";
+                                    if (!box.plateText.isEmpty()) {
+                                        const std::string plateText = box.plateText.toStdString();
+                                        const int plateY = std::min(
+                                                box.original_y + box.original_h + 22,
+                                                bgr_mat.rows - 4);
+                                        cv::putText(bgr_mat, plateText,
+                                                    cv::Point(box.original_x, plateY),
+                                                    cv::FONT_HERSHEY_SIMPLEX, 0.4,
+                                                    cv::Scalar(0, 220, 255), 2);
                                     }
-                                    int baseLine = 0;
-                                    cv::Size labelSize = cv::getTextSize(labelText, cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseLine);
-                                    
-                                    int textY = box.y - 5;
-                                    if (textY < labelSize.height) {
-                                        textY = box.y + labelSize.height + 5;
-                                    }
-                                    
-                                    // Draw label background
-                                    cv::rectangle(bgr_mat, cv::Point(box.x, textY - labelSize.height - 2), 
-                                                  cv::Point(box.x + labelSize.width, textY + baseLine), 
-                                                  boxColor, cv::FILLED);
-                                                  
-                                    // Draw label text in black
-                                    cv::putText(bgr_mat, labelText, cv::Point(box.x, textY), 
-                                                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
                                 }
-                            } else {
-                                std::string headerText = "CH " + std::to_string(channelId + 1);
-                                cv::putText(bgr_mat, headerText, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 200), 2);
                             }
 
                             // Convert cv::Mat to QImage
@@ -800,6 +716,7 @@ QRETURN ChannelContext::onEventVdec() {
                 }
             }
         }
+
         qcap2_rcbuffer_release(pScaledBuffer);
     }
 
@@ -816,19 +733,18 @@ QRETURN ChannelContext::onEventVdec() {
 
 // ── MainWindow Implementation ───────────────────────────────────────────────
 MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent), m_bFullscreen(false),
-      // AI init
-      m_bShowOverlay(true), m_bHalfRefreshRate(false),
-      handle(nullptr), flag(4),
+    : QMainWindow(parent),
+      m_bShowOverlay(true),
+      m_bFullscreen(false),
+      m_bHalfRefreshRate(false),
+      handle(nullptr), flag(QDEEP_API::QDEEP_OBJECT_DETECT_FLAG_FEATURE_VECTOR),
       ai_running(false), pAiThread(nullptr),
       ready_count(0), active_camera_count(0)
 {
-    setWindowTitle("QCAP Multichannel RTSP + QDEEP ReID");
+    setWindowTitle("QCAP Multichannel RTSP + QDEEP Plate Soft Decode");
     resize(1280, 720);
 
     g_pMainwindow = this;
-
-    target_capture_armed = false;
 
     // ── Initialize AI members ────────────────────────────────────────────
     color_space.resize(MAX_BATCH);
@@ -879,7 +795,7 @@ MainWindow::MainWindow(QWidget *parent)
     chkEnableDisplay->setChecked(true);
     grpLayout->addWidget(chkEnableDisplay);
 
-    chkShowOverlay = new QCheckBox("Show AI Detection Boxes", grpConfig);
+    chkShowOverlay = new QCheckBox("Show AI Plate Overlay", grpConfig);
     chkShowOverlay->setChecked(true);
     grpLayout->addWidget(chkShowOverlay);
 
@@ -888,17 +804,6 @@ MainWindow::MainWindow(QWidget *parent)
     grpLayout->addWidget(chkHalfRefreshRate);
 
     controlLayout->addWidget(grpConfig);
-
-    QGroupBox *grpTarget = new QGroupBox("ReID Target", controlPanel);
-    QVBoxLayout *targetLayout = new QVBoxLayout(grpTarget);
-    btnRegisterTarget = new QPushButton("Register Target (click a person)", grpTarget);
-    btnClearTarget = new QPushButton("Clear Target", grpTarget);
-    targetLayout->addWidget(btnRegisterTarget);
-    targetLayout->addWidget(btnClearTarget);
-    lblTargetStatus = new QLabel("No target registered", grpTarget);
-    lblTargetStatus->setWordWrap(true);
-    targetLayout->addWidget(lblTargetStatus);
-    controlLayout->addWidget(grpTarget);
 
     lblStatus = new QLabel("Status: Idle", controlPanel);
     lblStatus->setWordWrap(true);
@@ -924,8 +829,6 @@ MainWindow::MainWindow(QWidget *parent)
     connect(chkEnableDisplay, &QCheckBox::toggled, this, &MainWindow::onDisplayToggled);
     connect(chkShowOverlay, &QCheckBox::toggled, this, &MainWindow::onOverlayToggled);
     connect(chkHalfRefreshRate, &QCheckBox::toggled, this, &MainWindow::onHalfRefreshRateToggled);
-    connect(btnRegisterTarget, &QPushButton::clicked, this, &MainWindow::onRegisterTargetClicked);
-    connect(btnClearTarget, &QPushButton::clicked, this, &MainWindow::onClearTargetClicked);
 
     videoContainer->installEventFilter(this);
 
@@ -956,63 +859,10 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.191.6:1554/session0.mpg"));
+            QString defaultUrl = QString("rtsp://root:root@192.168.190.178:554/session0.mpg");
+            tableUrls->setItem(i, 1, new QTableWidgetItem(defaultUrl));
         }
     }
-}
-
-void MainWindow::onRegisterTargetClicked()
-{
-    {
-        std::lock_guard<std::mutex> lock(target_mtx);
-        target_features.clear();
-        target_capture_armed = true;
-    }
-    lblTargetStatus->setText("Click a detected person in any channel to register the target.");
-}
-
-void MainWindow::onClearTargetClicked()
-{
-    {
-        std::lock_guard<std::mutex> lock(target_mtx);
-        target_features.clear();
-        target_capture_armed = false;
-    }
-    lblTargetStatus->setText("No target registered");
-}
-
-bool MainWindow::captureTargetAt(int channelId, int frameX, int frameY)
-{
-    ReIdCandidate selected;
-    bool found = false;
-    {
-        std::lock_guard<std::mutex> lock(reid_mtx);
-        if (channelId < 0 || channelId >= MAX_BATCH) return false;
-        for (const ReIdCandidate& candidate : latest_candidates[channelId]) {
-            const bool inside = frameX >= candidate.x && frameX < candidate.x + candidate.width
-                && frameY >= candidate.y && frameY < candidate.y + candidate.height;
-            if (inside && (!found || candidate.width * candidate.height < selected.width * selected.height)) {
-                selected = candidate;
-                found = true;
-            }
-        }
-    }
-
-    if (!found) {
-        lblTargetStatus->setText("No detected person at this position. Try again when a person box is visible.");
-        return false;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(target_mtx);
-        target_features.clear();
-        target_features.push_back(selected.feature);
-        target_capture_armed = false;
-    }
-    lblTargetStatus->setText(QString("Target registered from CH%1 (detector %2%).")
-                                 .arg(channelId + 1)
-                                 .arg(selected.probability * 100.0f, 0, 'f', 0));
-    return true;
 }
 
 void MainWindow::onBtnStartClicked()
@@ -1021,6 +871,7 @@ void MainWindow::onBtnStartClicked()
     clearGrid();
 
     int count = spinChannelCount->value();
+
     int cols = 2;
     if (m_bFullscreen) {
         if (count >= 17) {
@@ -1048,8 +899,6 @@ void MainWindow::onBtnStartClicked()
         label->setAlignment(Qt::AlignCenter);
         label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
         label->setScaledContents(true);
-        label->setProperty("channelId", i);
-        label->installEventFilter(this);
         layout->addWidget(label);
 
         videoFrames.append(frame);
@@ -1093,9 +942,17 @@ void MainWindow::onBtnStopClicked()
 
 void MainWindow::stopAllChannels()
 {
+    std::vector<std::thread> stop_threads;
     for (ChannelContext *ctx : channels) {
         ctx->m_bSendBuffer = false;
-        delete ctx;
+        stop_threads.push_back(std::thread([ctx]() {
+            delete ctx;
+        }));
+    }
+    for (auto& t : stop_threads) {
+        if (t.joinable()) {
+            t.join();
+        }
     }
     channels.clear();
 }
@@ -1138,21 +995,6 @@ void MainWindow::closeEvent(QCloseEvent *event)
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
-    if (event->type() == QEvent::MouseButtonPress) {
-        QLabel *label = qobject_cast<QLabel*>(watched);
-        bool captureArmed = false;
-        {
-            std::lock_guard<std::mutex> lock(target_mtx);
-            captureArmed = target_capture_armed;
-        }
-        if (label && captureArmed && label->property("channelId").isValid()) {
-            QMouseEvent *mouseEvent = static_cast<QMouseEvent*>(event);
-            const int frameX = mouseEvent->pos().x() * 640 / qMax(1, label->width());
-            const int frameY = mouseEvent->pos().y() * 384 / qMax(1, label->height());
-            captureTargetAt(label->property("channelId").toInt(), frameX, frameY);
-            return true;
-        }
-    }
     if (event->type() == QEvent::MouseButtonDblClick) {
         m_bFullscreen = !m_bFullscreen;
         if (m_bFullscreen) {
@@ -1163,7 +1005,6 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
             showNormal();
         }
 
-        // Adjust Grid layout
         int count = videoFrames.size();
         if (count > 0) {
             int cols = 2;
@@ -1195,8 +1036,8 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 void MainWindow::onDisplayToggled(bool checked)
 {
     m_bEnableDisplay = checked;
-    for (auto* c : channels) {
-        c->setDisplayEnabled(checked);
+    for (ChannelContext *ctx : channels) {
+        ctx->setDisplayEnabled(checked);
     }
 }
 
@@ -1209,6 +1050,7 @@ void MainWindow::onHalfRefreshRateToggled(bool checked)
 {
     m_bHalfRefreshRate = checked;
 }
+
 
 // ── QDEEP / YOLO AI Functions ──────────────────────────────────────────────
 void MainWindow::init_models()
@@ -1223,17 +1065,16 @@ void MainWindow::init_models()
     }
 
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
-        (char*)"/home/nvidia/Projects/new_model/reid_batch/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
-        &handle, flag, MAX_BATCH);
+                QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+                QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_LICENSE_PLATE_RECOGNITION_LAW_ENFORCEMENT,
+                (char*)"/home/nvidia/Projects/new_model/lpr_batch/QDEEP.OD.LICENSE.PLATE.RECOGNITION.LAW.TINY.CFG",
+                &handle, flag, MAX_BATCH);
 
-
-    // qDebug() << "[AI Log] QDEEP_CREATE_BATCH_OBJECT_DETECT res:" << QString("0x%1").arg(res, 8, 16, QChar('0')) << "handle:" << handle;
+    qDebug() << "[AI Log] QDEEP_CREATE_BATCH_OBJECT_DETECT res:" << QString("0x%1").arg(res, 8, 16, QChar('0')) << "handle:" << handle;
 
     if (res == 0 && handle != nullptr) {
         QDEEP_API::QDEEP_START_OBJECT_DETECT(handle);
-        // QDEEP_API::QDEEP_SET_OBJECT_DETECT_PROPERTY(handle, 0.1);
+        QDEEP_API::QDEEP_SET_OBJECT_DETECT_PROPERTY(handle, 0.1);
     }
 
     res = QDEEP_GET_OBJECT_DETECT_RESERVED_STATUS(reinterpret_cast<PVOID>(0xD7CBB416), reinterpret_cast<ULONG*>(0x3B98119E));
@@ -1243,20 +1084,16 @@ void MainWindow::init_models()
 void MainWindow::uninit_models()
 {
     yolo_stop();
+
     if (handle != nullptr) {
         QDEEP_API::QDEEP_STOP_OBJECT_DETECT(handle);
         QDEEP_API::QDEEP_DESTROY_OBJECT_DETECT(handle);
         handle = nullptr;
     }
+
     for (size_t i = 0; i < MAX_BATCH; ++i) {
-        if (box_list_vec[i]) {
-            delete[] box_list_vec[i];
-            box_list_vec[i] = nullptr;
-        }
-        if (buffer_vec[i]) {
-            delete[] buffer_vec[i];
-            buffer_vec[i] = nullptr;
-        }
+        if (box_list_vec[i]) { delete[] box_list_vec[i]; box_list_vec[i] = nullptr; }
+        if (buffer_vec[i]) { delete[] buffer_vec[i]; buffer_vec[i] = nullptr; }
     }
 }
 
@@ -1275,43 +1112,44 @@ void MainWindow::yolo_start()
     }
 
     if (active_camera_count == 0) {
-        qDebug() << "[Warning] No active cameras found!";
+        qDebug() << "[Warning] No active cameras found! AI will not start.";
         return;
     }
 
     ai_running = true;
     pAiThread = new std::thread(&MainWindow::ai_inference_thread, this);
+    qDebug() << "[Info] AI inference started.";
 }
 
 void MainWindow::yolo_stop()
 {
-    ai_running = false;
-    cv.notify_all();
-
-    if (pAiThread) {
-        if (pAiThread->joinable()) {
-            pAiThread->join();
-        }
-        delete pAiThread;
-        pAiThread = nullptr;
-    }
+    if (!ai_running) return;
 
     for (ChannelContext *ctx : channels) {
         ctx->m_bSendBuffer = false;
     }
+
+    ai_running = false;
+    cv.notify_one();
+
+    if (pAiThread && pAiThread->joinable()) {
+        pAiThread->join();
+        delete pAiThread;
+        pAiThread = nullptr;
+    }
+    qDebug() << "[Info] AI inference stopped.";
 }
 
 void MainWindow::ai_inference_thread()
 {
-    QElapsedTimer timingReportTimer;
-    timingReportTimer.start();
-    quint64 apiSampleCount = 0;
-    double apiTotalMs = 0.0;
-    double apiMinMs = 0.0;
-    double apiMaxMs = 0.0;
+    auto last_log_time = std::chrono::steady_clock::now();
+    int inference_count = 0;
+    double api_total_ms = 0.0;
+    double api_min_ms = 0.0;
+    double api_max_ms = 0.0;
 
     while (ai_running) {
-        // Re-calculate active camera count
+        // 重新計算 active camera 數量
         active_camera_count = 0;
         for (ChannelContext *ctx : channels) {
             if (ctx->m_bSendBuffer && ctx->m_nVideoWidth > 0 && ctx->m_nVideoHeight > 0) {
@@ -1329,10 +1167,10 @@ void MainWindow::ai_inference_thread()
         // ── Drain each channel's queue, copy latest frame to buffer_vec ──
         bool has_any_frame = false;
 
-        // MAX_BATCH is detector capacity; submit only active channels as a compact batch.
+        // MAX_BATCH is only the detector capacity.  Pack active UI channels into
+        // contiguous slots and pass the resulting count to QDEEP below.
         std::vector<int> batch_channels;
         batch_channels.reserve(active_camera_count);
-
         for (int i = 0; i < MAX_BATCH; ++i) {
             ChannelContext* ctx = nullptr;
             for (auto* c : channels) {
@@ -1345,6 +1183,7 @@ void MainWindow::ai_inference_thread()
             if (ctx && ctx->m_bSendBuffer && ctx->m_nVideoWidth > 0 && ctx->m_nVideoHeight > 0 && ctx->m_pAIQueue) {
                 const size_t batch_index = batch_channels.size();
                 batch_channels.push_back(ctx->channelId);
+
                 // Drain queue: pop all, keep only the latest frame
                 qcap2_rcbuffer_t* pLatest = nullptr;
                 qcap2_rcbuffer_t* pBuf = nullptr;
@@ -1353,7 +1192,7 @@ void MainWindow::ai_inference_thread()
                     pLatest = pBuf;
                 }
 
-                // Copy latest frame data to buffer_vec for QDEEP
+                // Copy latest frame data to buffer_vec for QDEEP (NV12 format)
                 if (pLatest) {
                     has_any_frame = true;
                     PVOID pLockedData = qcap2_rcbuffer_lock_data(pLatest);
@@ -1368,10 +1207,12 @@ void MainWindow::ai_inference_thread()
                             ULONG copyWidth = 640;
                             ULONG copyHeight = 384;
                             if (pDstBuf) {
+                                // Copy Y plane
                                 int src_pitch_Y = pStride[0];
                                 for (ULONG row = 0; row < copyHeight; ++row) {
                                     memcpy(pDstBuf + row * copyWidth, pBuffer[0] + row * src_pitch_Y, copyWidth);
                                 }
+                                // Copy UV plane
                                 if (pBuffer[1] && pStride[1] > 0) {
                                     int src_pitch_UV = pStride[1];
                                     BYTE* pDstUV = pDstBuf + (copyWidth * copyHeight);
@@ -1410,103 +1251,76 @@ void MainWindow::ai_inference_thread()
             continue;
         }
 
-        // Reset box sizes
+        // 重置 box sizes
         for (size_t i = 0; i < MAX_BATCH; ++i) {
             box_size_vec[i] = BOX_SIZE;
         }
 
-        QElapsedTimer inferenceTimer;
-        inferenceTimer.start();
-        const QRESULT api_res = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
+        // steady_clock is monotonic, so this latency measurement is not affected by
+        // NTP/manual system-clock adjustments. It measures the full blocking time of
+        // the QDEEP API, including any internal upload, preprocessing, inference and wait.
+        const auto inference_start = std::chrono::steady_clock::now();
+        QRESULT api_res = QDEEP_API::QDEEP_SET_VIDEO_OBJECT_DETECT_BATCH_UNCOMPRESSION_BUFFER(
             handle, color_space.data(), width_vec.data(), height_vec.data(),
-            buffer_vec.data(), buffer_len_vec.data(), box_list_vec.data(), box_size_vec.data(), batch_size, flag);
-        const double apiMs = inferenceTimer.nsecsElapsed() / 1000000.0;
+            buffer_vec.data(), buffer_len_vec.data(), box_list_vec.data(), box_size_vec.data(), batch_size,
+            flag);
+        const auto inference_end = std::chrono::steady_clock::now();
+        const double api_ms = std::chrono::duration<double, std::milli>(inference_end - inference_start).count();
 
-        ++apiSampleCount;
-        apiTotalMs += apiMs;
-        if (apiSampleCount == 1 || apiMs < apiMinMs) apiMinMs = apiMs;
-        if (apiMs > apiMaxMs) apiMaxMs = apiMs;
+        inference_count++;
+        api_total_ms += api_ms;
+        if (inference_count == 1 || api_ms < api_min_ms) api_min_ms = api_ms;
+        if (api_ms > api_max_ms) api_max_ms = api_ms;
 
-        if (timingReportTimer.elapsed() >= 3000) {
-            qDebug() << QStringLiteral("[QDEEP timing: last 3s]\nreid batch: samples=%1 min_ms=%2 max_ms=%3 avg_ms=%4")
-                        .arg(apiSampleCount)
-                        .arg(apiMinMs, 0, 'f', 3)
-                        .arg(apiMaxMs, 0, 'f', 3)
-                        .arg(apiTotalMs / apiSampleCount, 0, 'f', 3);
-            apiSampleCount = 0;
-            apiTotalMs = 0.0;
-            apiMinMs = 0.0;
-            apiMaxMs = 0.0;
-            timingReportTimer.restart();
+        // 記錄 AI FPS（每 5 秒輸出一次）
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count();
+        if (elapsed >= 5) {
+            double ai_fps = (double)inference_count / elapsed;
+            qDebug() << QString("[AI QDEEP plate] %1 Hz (%2 calls in %3s, batch=%4, api_ms avg/min/max=%5/%6/%7)")
+                        .arg(ai_fps, 0, 'f', 1)
+                        .arg(inference_count)
+                        .arg(elapsed)
+                        .arg(active_camera_count)
+                        .arg(api_total_ms / inference_count, 0, 'f', 2)
+                        .arg(api_min_ms, 0, 'f', 2)
+                        .arg(api_max_ms, 0, 'f', 2);
+            inference_count = 0;
+            api_total_ms = 0.0;
+            api_min_ms = 0.0;
+            api_max_ms = 0.0;
+            last_log_time = now;
         }
 
-        // Compare every detected person with the registered target feature and
-        // publish both the display boxes and click-selectable feature candidates.
-        std::vector<std::array<float, QDEEP_MAX_FEATURE_VECTOR_SIZE>> targetFeatures;
+        // Store plate boxes in channel-id order for the display callback.
         {
-            std::lock_guard<std::mutex> lock(target_mtx);
-            targetFeatures = target_features;
-        }
+            std::lock_guard<std::mutex> draw_lock(draw_mtx);
+            for (int channel_id : batch_channels) {
+                draw_boxes[channel_id].clear();
+            }
+            if (api_res == QCAP_RS_SUCCESSFUL) {
+                for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
+                    std::vector<DrawBox>& channel_boxes = draw_boxes[batch_channels[batch_index]];
+                    for (ULONG j = 0; j < box_size_vec[batch_index]; ++j) {
+                        const auto& deep_box = box_list_vec[batch_index][j];
+                        DrawBox box;
+                        box.classId = deep_box.nClassID;
+                        box.probability = deep_box.fProbability;
+                        box.original_x = deep_box.nX;
+                        box.original_y = deep_box.nY;
+                        box.original_w = deep_box.nWidth;
+                        box.original_h = deep_box.nHeight;
 
-        std::vector<std::vector<DrawBox>> updatedDrawBoxes(batch_channels.size());
-        std::vector<float> topSimilarities(batch_channels.size(), -1.0f);
-        std::vector<size_t> topBoxIndices(batch_channels.size(), 0);
-        std::vector<std::vector<ReIdCandidate>> updatedCandidates(batch_channels.size());
-        if (api_res == QCAP_RS_SUCCESSFUL) {
-            for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
-                for (ULONG j = 0; j < box_size_vec[batch_index]; ++j) {
-                    const auto& deep_box = box_list_vec[batch_index][j];
-                    ReIdCandidate candidate;
-                    candidate.x = static_cast<int>(deep_box.nX);
-                    candidate.y = static_cast<int>(deep_box.nY);
-                    candidate.width = static_cast<int>(deep_box.nWidth);
-                    candidate.height = static_cast<int>(deep_box.nHeight);
-                    candidate.probability = deep_box.fProbability;
-                    memcpy(candidate.feature.data(), deep_box.fFeatureVectors, sizeof(deep_box.fFeatureVectors));
-                    updatedCandidates[batch_index].push_back(candidate);
-
-                    DrawBox box;
-                    box.x = candidate.x;
-                    box.y = candidate.y;
-                    box.width = candidate.width;
-                    box.height = candidate.height;
-                    box.probability = candidate.probability;
-                    box.isTarget = false;
-                    box.targetSimilarity = -1.0f;
-                    for (const auto& reference : targetFeatures) {
-                        float similarity = 0.0f;
-                        const QRESULT comparisonResult = QDEEP_API::QDEEP_GET_OBJECT_RECOGNITION_COMPARISON(
-                            QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
-                            const_cast<float*>(reference.data()), candidate.feature.data(), &similarity);
-                        if (comparisonResult == QCAP_RS_SUCCESSFUL) {
-                            box.targetSimilarity = std::max(box.targetSimilarity, similarity);
+                        const char* feature = reinterpret_cast<const char*>(deep_box.fFeatureVectors);
+                        const int maxLength = QDEEP_MAX_FEATURE_VECTOR_SIZE * sizeof(float);
+                        int length = 0;
+                        while (length < maxLength && feature[length] != '\0') {
+                            ++length;
                         }
-                    }
-                    updatedDrawBoxes[batch_index].push_back(box);
-                    if (!targetFeatures.empty() && box.targetSimilarity > topSimilarities[batch_index]) {
-                        topSimilarities[batch_index] = box.targetSimilarity;
-                        topBoxIndices[batch_index] = updatedDrawBoxes[batch_index].size() - 1;
+                        box.plateText = QString::fromUtf8(feature, length).trimmed();
+                        channel_boxes.push_back(box);
                     }
                 }
-            }
-        }
-
-        if (!targetFeatures.empty()) {
-            for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
-                if (topSimilarities[batch_index] >= 0.90f) {
-                    updatedDrawBoxes[batch_index][topBoxIndices[batch_index]].isTarget = true;
-                }
-            }
-        }
-
-
-        {
-            std::lock_guard<std::mutex> drawLock(draw_mtx);
-            std::lock_guard<std::mutex> candidateLock(reid_mtx);
-            for (size_t batch_index = 0; batch_index < batch_channels.size(); ++batch_index) {
-                const int channel_id = batch_channels[batch_index];
-                draw_boxes[channel_id] = std::move(updatedDrawBoxes[batch_index]);
-                latest_candidates[channel_id] = std::move(updatedCandidates[batch_index]);
             }
         }
     }
