@@ -78,7 +78,6 @@ struct ChannelContext {
     qcap2_video_decoder_t* pVdec;
     qcap2_event_handlers_t* pEventHandlers;
     qcap2_event_t* pEvent_vdec;
-    qcap2_video_scaler_t* pScaler2;
     qcap2_rcbuffer_t* m_pCurrentAIRCBuffer;
     qcap2_rcbuffer_queue_t* m_pAIQueue;      // AI frame queue for pipeline optimization
 
@@ -107,11 +106,6 @@ struct ChannelContext {
     // ── AI fields ────────────────────────────────────────────────────────
     bool m_bSendBuffer;         // Whether to send frames to AI
     double m_lastProcessTime;   // Last AI frame submission time
-    bool m_bFrameReady;         // Whether a frame is ready for AI
-    BYTE* m_pAIBuffer;          // NV12 data buffer for AI
-    ULONG m_nAIBufferLen;       // Length of AI buffer
-    int m_nAIWidth;             // Width for AI processing
-    int m_nAIHeight;            // Height for AI processing
 
     ChannelContext(int id, const QString& streamUrl, QLabel* pLabel);
     ~ChannelContext();

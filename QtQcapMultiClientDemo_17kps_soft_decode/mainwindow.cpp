@@ -892,7 +892,7 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            QString defaultUrl = QString("rtsp://root:root@192.168.191.6:1554/session0.mpg");
+            QString defaultUrl = QString("rtsp://root:root@192.168.190.104:554/session0.mpg");
             tableUrls->setItem(i, 1, new QTableWidgetItem(defaultUrl));
         }
     }

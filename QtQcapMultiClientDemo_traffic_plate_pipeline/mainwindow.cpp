@@ -1556,22 +1556,32 @@ void MainWindow::printInferenceTimingStats()
 void MainWindow::layer1_batch_inference_thread(Layer1BatchWorker* worker)
 {
     if (!worker || !worker->handle) return;
+    std::vector<std::shared_ptr<SharedFrame>> cachedFrames(worker->channelIds.size());
     while (ai_running.load()) {
         std::vector<std::shared_ptr<SharedFrame>> batchFrames;
         {
             std::unique_lock<std::mutex> lock(worker->queueMutex);
             worker->queueCv.wait(lock, [this, worker] {
                 if (!ai_running.load()) return true;
-                return std::all_of(worker->pendingFrames.begin(), worker->pendingFrames.end(),
+                return std::any_of(worker->pendingFrames.begin(), worker->pendingFrames.end(),
                                    [](const std::shared_ptr<SharedFrame>& frame) { return frame != nullptr; });
             });
             if (!ai_running.load()) break;
 
             batchFrames.resize(worker->channelIds.size());
             for (size_t slot = 0; slot < worker->channelIds.size(); ++slot) {
-                batchFrames[slot] = worker->pendingFrames[slot];
-                worker->pendingFrames[slot].reset();
+                if (worker->pendingFrames[slot]) {
+                    cachedFrames[slot] = std::move(worker->pendingFrames[slot]);
+                }
+                batchFrames[slot] = cachedFrames[slot];
             }
+        }
+
+        // The initial batch needs a real frame from every channel. Afterwards
+        // a refreshed slot reuses the most recent frame from every other slot.
+        if (!std::all_of(cachedFrames.begin(), cachedFrames.end(),
+                         [](const std::shared_ptr<SharedFrame>& frame) { return frame != nullptr; })) {
+            continue;
         }
 
         const size_t batchSize = worker->channelIds.size();
@@ -1758,22 +1768,32 @@ void MainWindow::layer2_plate_inference_thread(Layer2PlateWorker* worker)
 void MainWindow::layer3_batch_inference_thread(Layer3BatchWorker* worker)
 {
     if (!worker || !worker->handle) return;
+    std::vector<std::shared_ptr<SharedFrame>> cachedFrames(worker->channelIds.size());
     while (ai_running.load()) {
         std::vector<std::shared_ptr<SharedFrame>> batchFrames;
         {
             std::unique_lock<std::mutex> lock(worker->queueMutex);
             worker->queueCv.wait(lock, [this, worker] {
                 if (!ai_running.load()) return true;
-                return std::all_of(worker->pendingFrames.begin(), worker->pendingFrames.end(),
+                return std::any_of(worker->pendingFrames.begin(), worker->pendingFrames.end(),
                                    [](const std::shared_ptr<SharedFrame>& frame) { return frame != nullptr; });
             });
             if (!ai_running.load()) break;
 
             batchFrames.resize(worker->channelIds.size());
             for (size_t slot = 0; slot < worker->channelIds.size(); ++slot) {
-                batchFrames[slot] = worker->pendingFrames[slot];
-                worker->pendingFrames[slot].reset();
+                if (worker->pendingFrames[slot]) {
+                    cachedFrames[slot] = std::move(worker->pendingFrames[slot]);
+                }
+                batchFrames[slot] = cachedFrames[slot];
             }
+        }
+
+        // The initial batch needs a real frame from every channel. Afterwards
+        // a refreshed slot reuses the most recent frame from every other slot.
+        if (!std::all_of(cachedFrames.begin(), cachedFrames.end(),
+                         [](const std::shared_ptr<SharedFrame>& frame) { return frame != nullptr; })) {
+            continue;
         }
 
         const size_t batchSize = worker->channelIds.size();
