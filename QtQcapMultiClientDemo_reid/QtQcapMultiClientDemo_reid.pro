@@ -14,7 +14,8 @@ SOURCES += \
         mainwindow.cpp
 
 HEADERS += \
-        mainwindow.h
+        mainwindow.h \
+        ../decoded_nv12_frame.h
 
 INCLUDEPATH += \
     ../include \
@@ -22,10 +23,11 @@ INCLUDEPATH += \
     ../qdeep/include \
     /usr/include/opencv4
 
-QMAKE_LFLAGS += -Wl,-rpath,$$PWD/../lib \
-                -Wl,-rpath,$$PWD/../qdeep/lib
+QMAKE_LFLAGS += -Wl,-rpath,$$PWD/../qdeep/lib \
+                -Wl,-rpath,$$PWD/../lib
 
-LIBS += -L$$PWD/../lib -lqcap -lqcap2_rcbuffer -lQDEEP
+LIBS += -L$$PWD/../lib -lqcap -lqcap2_rcbuffer \
+        -L$$PWD/../qdeep/lib -lQDEEP
 
 CONFIG += link_pkgconfig
 PKGCONFIG += opencv4
