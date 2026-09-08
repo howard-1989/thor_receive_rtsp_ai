@@ -782,7 +782,7 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.190.232:554/session0.mpg"));
+            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.191.23:554/session0.mpg"));
         }
     }
 }
@@ -1106,7 +1106,7 @@ void MainWindow::yolo_start()
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
         QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
         QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
-        (char*)"/home/nvidia/Projects/model_0817/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
+        (char*)"/home/nvidia/qdeep/demo/model/skeleton_ex_Batch64_F1_203_9_5_1/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
         &handle, flag, nMaxBatch);
     qDebug() << "[AI Log] QDEEP_CREATE_BATCH_OBJECT_DETECT res:"
              << QString("0x%1").arg(res, 8, 16, QChar('0'))

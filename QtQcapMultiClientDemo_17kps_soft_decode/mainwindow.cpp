@@ -892,7 +892,7 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            QString defaultUrl = QString("rtsp://root:root@192.168.190.104:554/session0.mpg");
+            QString defaultUrl = QString("rtsp://root:root@172.19.0.56:554/session0.mpg");
             tableUrls->setItem(i, 1, new QTableWidgetItem(defaultUrl));
         }
     }
@@ -1103,12 +1103,25 @@ void MainWindow::init_models()
     //        (char*)"/home/nvidia/Music/thor_receive_rtsp_ai/model/skeleton_ex/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
     //        &handle, flag, MAX_BATCH);
 
-    //arya
+    // QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
+    //             QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+    //             QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
+    //             (char*)"/home/nvidia/qdeep/demo/model/skeleton_ex_Batch64_F1_203_9_5_1/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
+    //             &handle, flag, MAX_BATCH);
+
     QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
-                QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
-                QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
-                (char*)"/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/model/skeleton_ex/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
-                &handle, flag, MAX_BATCH);
+        QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+        QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
+        (char*)"/home/nvidia/qdeep/demo/model/skeleton_ex_Batch32_F1_203_9_5_1/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
+        &handle, flag, MAX_BATCH);
+
+
+    //arya
+    // QRESULT res = QDEEP_API::QDEEP_CREATE_BATCH_OBJECT_DETECT(
+    //             QDEEP_API::QDEEP_GPU_TYPE_NVIDIA, 0,
+    //             QDEEP_API::QDEEP_OBJECT_DETECT_CONFIG_MODEL_HUMAN_SKELETON_17_KEYPOINTS_EX,
+    //             (char*)"/home/nvidia/Documents/QtQcapMultiClientDemo_onlydecode_npptosys/model/skeleton_ex/QDEEP.OD.HUMAN.SKELETON.17KPS.EX.CFG",
+    //             &handle, flag, MAX_BATCH);
 
     qDebug() << "[AI Log] QDEEP_CREATE_BATCH_OBJECT_DETECT res:" << QString("0x%1").arg(res, 8, 16, QChar('0')) << "handle:" << handle;
 

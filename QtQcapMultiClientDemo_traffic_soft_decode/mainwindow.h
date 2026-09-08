@@ -39,7 +39,7 @@ namespace QDEEP_API {
 #define BOX_SIZE 100
 #define MAX_BATCH 64
 #define MAX_BUFFER_SIZE (1920 * 1080 * 3 / 2)
-#define DEFAULT_AI_TARGET_FPS 30.0
+#define DEFAULT_AI_TARGET_FPS 15.0
 
 struct DrawBox {
     int x;
