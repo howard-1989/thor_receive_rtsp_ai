@@ -992,8 +992,46 @@ QRETURN ChannelContext::onDecodedVideoFrame(
                         boxes = g_pMainwindow->draw_boxes[channelId];
                     }
                     for (const DrawBox& box : boxes) {
+                        cv::Scalar boxColor;
+                        std::string className;
+                        switch (box.classID) {
+                        case 0:
+                            className = "Pedestrian";
+                            boxColor = cv::Scalar(0, 255, 255); // Yellow
+                            break;
+                        case 1:
+                            className = "Motorcycle";
+                            boxColor = cv::Scalar(255, 0, 255); // Magenta
+                            break;
+                        case 2:
+                            className = "Car";
+                            boxColor = cv::Scalar(0, 255, 0);   // Green
+                            break;
+                        case 3:
+                            className = "Large Vehicle";
+                            boxColor = cv::Scalar(255, 255, 0); // Cyan
+                            break;
+                        default:
+                            className = "Class " + std::to_string(box.classID);
+                            boxColor = cv::Scalar(0, 165, 255); // Orange
+                            break;
+                        }
+
                         cv::rectangle(bgrMat, cv::Rect(box.x, box.y, box.width, box.height),
-                                      cv::Scalar(0, 255, 0), 2);
+                                      boxColor, 2);
+
+                        int baseLine = 0;
+                        const cv::Size labelSize = cv::getTextSize(
+                            className, cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseLine);
+                        int textY = box.y - 5;
+                        if (textY < labelSize.height)
+                            textY = box.y + labelSize.height + 5;
+                        cv::rectangle(bgrMat,
+                                      cv::Point(box.x, textY - labelSize.height - 2),
+                                      cv::Point(box.x + labelSize.width, textY + baseLine),
+                                      boxColor, cv::FILLED);
+                        cv::putText(bgrMat, className, cv::Point(box.x, textY),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
                     }
                 }
                 cv::putText(bgrMat, "CH " + std::to_string(channelId + 1), cv::Point(10, 25),
@@ -1155,7 +1193,7 @@ void MainWindow::onChannelCountChanged(int count)
 
         QTableWidgetItem *itemUrl = tableUrls->item(i, 1);
         if (!itemUrl || itemUrl->text().isEmpty()) {
-            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.190.228 :554/session0.mpg"));
+            tableUrls->setItem(i, 1, new QTableWidgetItem("rtsp://root:root@192.168.190.228:554/session0.mpg"));
         }
     }
 }
